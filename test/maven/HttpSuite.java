@@ -14,12 +14,13 @@ import static org.junit.Assert.*;
 public class HttpSuite {
     private static final ObjectMapper JSON = new ObjectMapper();
     private HttpServer server;
+    private Accounts accounts;
     private String alice, bob, day;
 
     @Before public void start() throws Exception {
         Acceptance.Time clock = new Acceptance.Time();
         BookingStore db = new BookingStore("jdbc:derby:memory:http"+UUID.randomUUID()+";create=true",clock);
-        Accounts accounts = new Accounts(db,clock);
+        accounts = new Accounts(db,clock);
         server = HttpServer.create(new InetSocketAddress("127.0.0.1",0),0);
         server.createContext("/",exchange -> Server.handle(db,accounts,exchange));
         server.start();
@@ -77,6 +78,22 @@ public class HttpSuite {
         request("POST","/bookings/"+id+"/cancel",bob,"",403,"FORBIDDEN");
         request("POST","/admin/room-status",bob,"room=1&enabled=false&reason=testing",403,"FORBIDDEN");
         request("GET","/my-bookings?date=invalid",bob,null,400,"INVALID_DATE_FORMAT");
+    }
+
+    @Test public void usageReportRequiresAdminAndShowsBookedMinutes() throws Exception {
+        String path = "/admin/reports/usage?from="+day+"&to="+day;
+        request("POST","/bookings",alice,booking(1),201,"OK");
+        request("GET",path,null,null,401,"UNAUTHORIZED");
+        request("GET",path,bob,null,403,"FORBIDDEN");
+        accounts.bootstrap("http-admin-password");
+        String admin = request("POST","/login",null,"username=admin&password=http-admin-password",200,"OK").get("token").asText();
+        JsonNode report = request("GET",path,admin,null,200,"OK");
+        assertEquals(1, report.size());
+        JsonNode room = report.get(0).path("rooms").get(0);
+        assertEquals(1, room.get("room").intValue());
+        assertEquals(60, room.get("bookedMinutes").intValue());
+        assertEquals(540, room.get("availableMinutes").intValue());
+        assertEquals("alice", report.get(0).path("users").get(0).get("username").asText());
     }
 
     @Test public void conflictingMovePreservesOriginalReservation() throws Exception {

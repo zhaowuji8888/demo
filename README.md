@@ -84,7 +84,7 @@ POST 使用 application/x-www-form-urlencoded。除注册、登录外均需 Auth
 
 所有路径也支持 `/api` 前缀。创建与改期须在 30 天内，开始时间允许 5 分钟宽限，每次最多 4 小时，每人每天最多 5 笔有效预约。登录连续失败 5 次后锁定 15 分钟，同一 IP 每分钟最多发起 20 次登录请求。
 
-报表按请求范围裁剪首尾周或月。使用率用已确认、已签到及已完成预约占用的分钟数，除以按当前房间状态和日历计算、扣除维护后的可用分钟数。没有可用分钟时返回 null。
+报表按请求范围裁剪首尾周或月。可用分钟按当前房间状态和开放日历计算，并扣除维护时段。已订分钟只累计可用时段中已确认、已签到或已完成的预约。使用率等于已订分钟除以可用分钟；可用分钟为零时返回 `null`。
 
 邮件投递需要 Python 3 以及 `ROOMBOOK_SMTP_HOST`、`ROOMBOOK_SMTP_USER`、`ROOMBOOK_SMTP_PASSWORD`、`ROOMBOOK_SMTP_FROM`。可选 `ROOMBOOK_SMTP_PORT` 默认 465，使用 SMTP over TLS。未设置收件邮箱的账号只收站内信。
 
@@ -97,6 +97,23 @@ POST 使用 application/x-www-form-urlencoded。除注册、登录外均需 Auth
 - 每次预约按半小时写入 slots，复合主键（房间、日期、起始分钟）阻止重复占用。改期时释放原时段和占用新时段在同一事务中完成，遇到冲突会回滚。
 - 预约与维护通过房间版本号协调并发写入。
 - 停用覆盖整个房间，若有尚未结束的预约则拒绝。维护仅针对指定日期的半开区间，已有预约或维护重叠时拒绝。结束时刻起可以重新预约。撤销维护或重新启用后，其他限制仍独立生效。
+
+## 使用率报表性能验证
+
+在同一台机器上，用 JDK 8 和 Derby 内存库生成 3 间会议室、732 条预约记录。按周生成报表，各预热 3 次，再取 7 次耗时的中位数。基线提交为 `044b20c`。两个日期范围分别对比，优化前后报表 JSON 的 SHA-256 均一致。
+
+| 查询范围 | 优化前 SELECT 次数 | 优化后 SELECT 次数 | 优化前耗时 | 优化后耗时 |
+| --- | ---: | ---: | ---: | ---: |
+| 7 天 | 25 | 6 | 4.14 ms | 1.81 ms |
+| 365 天 | 1,201 | 6 | 31.55 ms | 12.75 ms |
+
+在 Windows 上运行 `.\run.ps1 -Test` 编译后，用以下命令复测当前版本。耗时随硬件和数据量变化。
+
+```powershell
+$jdk = Split-Path (Split-Path (Get-Command javac).Source)
+$derby = if ($env:DERBY_JAR) { $env:DERBY_JAR } else { Join-Path $jdk 'db\lib\derby.jar' }
+& (Join-Path $jdk 'bin\java.exe') -cp "out;$derby" rooms.UsageBenchmark
+```
 
 ## 简历写法
 

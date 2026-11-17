@@ -81,9 +81,6 @@ class RoomCatalog extends Database {
         });
     }
 
-    static final String CALENDAR = " LEFT JOIN room_hours h ON h.room=r.id AND h.weekday=? "
-        +"LEFT JOIN day_override d ON d.room=r.id AND d.booked_day=? LEFT JOIN holidays g ON g.booked_day=? ";
-    static final String OPEN = " (d.room IS NOT NULL OR g.booked_day IS NULL) AND COALESCE(d.opens,h.opens,540)<=? AND COALESCE(d.closes,h.closes,1080)>=? ";
     static List<String[]> search(Connection c, BookingStore.Window w,int people,String needs,Integer room,boolean checkSlots) throws SQLException {
         StringBuilder sql=new StringBuilder("SELECT r.id,r.label,r.capacity,r.equipment FROM rooms r WHERE r.deleted=0 AND r.enabled=1 AND r.capacity>=? ")
                 .append("AND (EXISTS (SELECT 1 FROM day_override d WHERE d.room=r.id AND d.booked_day=? AND d.opens<=? AND d.closes>=?) OR (")
