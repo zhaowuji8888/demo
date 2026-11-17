@@ -4,9 +4,21 @@ import java.sql.*;
 import java.time.*;
 import java.util.*;
 
-public final class BookingStore extends Database {
-    BookingStore(String url) throws SQLException { super(url); migrate(); }
+public final class BookingStore extends RoomCatalog {
+    static final ZoneId ZONE = ZoneId.of("Asia/Shanghai");
+    final Clock clock;
+    BookingStore(String url) throws SQLException { this(url,Clock.system(ZONE)); }
+    BookingStore(String url,Clock clock) throws SQLException { super(url); this.clock=clock.withZone(ZONE); migrate(); }
 
+    void validateBooking(Window w) {
+        LocalDateTime now = LocalDateTime.now(clock);
+        LocalDate day = w.date.toLocalDate();
+        if (w.end-w.start>240 || day.isAfter(now.toLocalDate().plusDays(30)) ||
+                day.atStartOfDay().plusMinutes(w.start).isBefore(now.minusMinutes(5)))
+            throw new Problem(400,"TIME_OUT_OF_RANGE","Book up to 30 days ahead for 30 minutes to 4 hours");
+    }
+
+    BookingStore(javax.sql.DataSource source,Clock clock) { super(""); this.source=source; this.clock=clock.withZone(ZONE); }
     static final class Conflict extends Problem {
         Conflict(String message) { super(409,message); }
     }
@@ -14,8 +26,8 @@ public final class BookingStore extends Database {
         final java.sql.Date date;
         final int start, end;
         Window(LocalDate day, int start, int end) {
-            if (day == null || start < 540 || end > 1080 || start >= end || start % 30 != 0 || end % 30 != 0)
-                throw new Problem(400,"Use half-hour slots between 09:00 and 18:00");
+            if (day == null || start < 0 || end > 1440 || start >= end || start % 30 != 0 || end % 30 != 0)
+                throw new Problem(400,"TIME_OUT_OF_RANGE","Use aligned half-hour slots within one day");
             this.date = java.sql.Date.valueOf(day);
             this.start = start;
             this.end = end;
@@ -31,7 +43,7 @@ public final class BookingStore extends Database {
         }
         return String.join(",",names);
     }
-    private static boolean supports(String inventory, String needs) {
+    static boolean supports(String inventory, String needs) {
         return needs.isEmpty() || Arrays.asList(inventory.split(",")).containsAll(Arrays.asList(needs.split(",")));
     }
     static String reason(String value) {
@@ -40,24 +52,19 @@ public final class BookingStore extends Database {
         return value.trim();
     }
 
-    // This single-site service serializes scheduling writes. Checks and changes share one transaction.
-    private <T> T schedule(Work<T> action) throws SQLException {
-        return transaction(c -> {
-            try (Statement s = c.createStatement()) { s.execute("LOCK TABLE rooms IN EXCLUSIVE MODE"); }
-            return action.run(c);
-        });
-    }
     private static String[] room(Connection c, int id) throws SQLException {
-        List<String[]> result = rows(c,"SELECT enabled,equipment FROM rooms WHERE id=?",id);
+        List<String[]> result = rows(c,"SELECT enabled,equipment,capacity FROM rooms WHERE id=?",id);
         if (result.isEmpty()) throw new Problem(400,"Unknown room");
         return result.get(0);
     }
-    private static void checkRoom(Connection c, int id, Window w, String needs) throws SQLException {
+    private static void checkRoom(Connection c, int id, Window w, String needs,int attendees) throws SQLException {
         String[] room = room(c,id);
-        if ("0".equals(room[0])) throw new Conflict("Room is disabled");
+        if ("0".equals(room[0])) throw new Problem(409,"ROOM_DISABLED","Room is disabled");
+        if (attendees>Integer.parseInt(room[2])) throw new Problem(409,"CAPACITY_EXCEEDED","Maximum capacity is "+room[2]);
         if (!supports(room[1],needs)) throw new Conflict("Room lacks required equipment");
         if (!rows(c,"SELECT id FROM maintenance WHERE room=? AND booked_day=? AND first_min<? AND last_min>?",
-                id,w.date,w.end,w.start).isEmpty()) throw new Conflict("Room under maintenance");
+                id,w.date,w.end,w.start).isEmpty()) throw new Problem(409,"ROOM_MAINTENANCE","Room under maintenance");
+        if(search(c,w,0,"",id,false).isEmpty()) throw new Problem(409,"ROOM_CLOSED","Room closed for this interval");
     }
     private static void reserveSlots(Connection c, String id, int room, Window w) throws SQLException {
         try (PreparedStatement slot = c.prepareStatement("INSERT INTO slots VALUES (?,?,?,?)")) {
@@ -68,68 +75,126 @@ public final class BookingStore extends Database {
                 slot.setInt(3,minute);
                 try { slot.executeUpdate(); }
                 catch (SQLException e) {
-                    if ("23505".equals(e.getSQLState())) throw new Conflict("Time slot already reserved");
+                    if ("23505".equals(e.getSQLState()) || e.getErrorCode()==1062) throw new Problem(409,"SLOT_CONFLICT","Time slot already reserved");
                     throw e;
                 }
             }
         }
     }
 
-    String book(Accounts.User user, int room, Window w, String rawNeeds) throws SQLException {
-        String needs = equipment(rawNeeds);
-        return schedule(c -> {
-            checkRoom(c,room,w,needs);
-            String id = UUID.randomUUID().toString();
-            update(c,"INSERT INTO bookings (id,secret,room,booked_day,first_min,last_min,holder,owner_name,needs) VALUES (?,?,?,?,?,?,?,?,?)",
-                    id,UUID.randomUUID().toString(),room,w.date,w.start,w.end,user.name,user.name,needs);
-            reserveSlots(c,id,room,w);
-            return id;
+    private static void quota(Connection c,String owner,Window w,String exclude) throws SQLException {
+        update(c,"UPDATE accounts SET is_admin=is_admin WHERE username=?",owner);
+        int count=Integer.parseInt(rows(c,"SELECT COUNT(*) FROM bookings WHERE owner_name=? AND booked_day=? AND status IN ('CONFIRMED','PENDING_APPROVAL','CHECKED_IN') AND id<>?",owner,w.date,exclude).get(0)[0]);
+        if (count>=5) throw new Problem(409,"DAILY_QUOTA","Daily limit is five active bookings");
+    }
+    String book(Accounts.User user,int room,Window w,String rawNeeds,int attendees) throws SQLException {
+        return recurring(user,room,w,rawNeeds,attendees,1).get(0)[0];
+    }
+    List<String[]> recurring(Accounts.User user,int room,Window w,String rawNeeds,int attendees,int weeks) throws SQLException {
+        String needs=equipment(rawNeeds);
+        if(attendees<1) throw new Problem(400,"INVALID_ATTENDEES","attendees must be positive");
+        if(weeks<1 || weeks>5) throw new Problem(400,"Invalid weekly occurrence count");
+        String series=weeks==1?null:UUID.randomUUID().toString();
+        return transaction(c -> {
+            List<String[]> ids=new ArrayList<>();
+            for(int i=0;i<weeks;i++) {
+                Window day=new Window(w.date.toLocalDate().plusWeeks(i),w.start,w.end);
+                validateBooking(day);
+                quota(c,user.name,day,"");
+                long suspended=Long.parseLong(rows(c,"SELECT suspended_until FROM accounts WHERE username=?",user.name).get(0)[0]);
+                if(suspended>clock.millis()) throw new Problem(403,"BOOKING_SUSPENDED","Bookings suspended for repeated no-shows");
+                if(i==0) lockRoom(c,room);
+                checkRoom(c,room,day,needs,attendees);
+                String id=UUID.randomUUID().toString();
+                String status="1".equals(rows(c,"SELECT approval FROM rooms WHERE id=?",room).get(0)[0])?"PENDING_APPROVAL":"CONFIRMED";
+                update(c,"INSERT INTO bookings (id,room,booked_day,first_min,last_min,holder,owner_name,needs,attendees,status,series_id) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                    id,room,day.date,day.start,day.end,user.name,user.name,needs,attendees,status,series);
+                try { reserveSlots(c,id,room,day); }
+                catch(Problem e) { throw new Problem(e.status,e.code,"Room "+room+" is occupied on "+day.date+" at "+Server.time(Integer.toString(day.start))); }
+                audit(c,user,"create-booking",id,status);
+                notice(c,user.name,id,"BOOKED","Booking "+status+" on "+day.date);
+                ids.add(new String[]{id,day.date.toString()});
+            }
+            return ids;
         });
     }
 
-    private static String authorize(Connection c, Accounts.User user, String id, String legacyKey,
-                                    String action, String why) throws SQLException {
-        List<String[]> found = rows(c,"SELECT owner_name,secret,needs FROM bookings WHERE id=?",id);
-        if (found.isEmpty()) throw new Problem(404,"Booking not found");
-        String[] booking = found.get(0);
-        if (user.name.equals(booking[0])) return booking[2];
-        if (!user.admin && booking[0] == null && booking[1].equals(legacyKey)) return booking[2];
-        user.requireAdmin();
-        audit(c,user,action,id,why);
-        return booking[2];
+    static void notice(Connection c,String owner,String booking,String type,String message) throws SQLException {
+        update(c,"INSERT INTO notices(id,recipient,booking,kind,body,state) VALUES (?,?,?,?,?,'QUEUED')",
+            UUID.randomUUID().toString(),owner,booking,type,message);
     }
 
-    void cancel(Accounts.User user, String id, String legacyKey, String why) throws SQLException {
-        schedule(c -> {
-            authorize(c,user,id,legacyKey,"cancel",why);
-            update(c,"DELETE FROM bookings WHERE id=?",id);
+    private static String[] authorize(Connection c,Accounts.User user,String id,String why) throws SQLException {
+        List<String[]> found=rows(c,"SELECT owner_name,needs,room,attendees,status FROM bookings WHERE id=?",id);
+        if(found.isEmpty()) throw new Problem(404,"Booking not found");
+        String[] booking=found.get(0);
+        if (!user.name.equals(booking[0])) { user.requireAdmin(); reason(why); }
+        if (!"CONFIRMED".equals(booking[4]) && !"PENDING_APPROVAL".equals(booking[4]))
+            throw new Problem(409,"INVALID_STATE","Booking cannot be modified in its current state");
+        return booking;
+    }
+    void cancel(Accounts.User user,String id,String why) throws SQLException {
+        transaction(c -> {
+            String[] booking=authorize(c,user,id,why);
+            lockRoom(c,Integer.parseInt(booking[2]));
+            if(update(c,"UPDATE bookings SET status='CANCELLED',cancelled_at=CURRENT_TIMESTAMP,cancelled_by=? WHERE id=? AND room=? AND status IN ('CONFIRMED','PENDING_APPROVAL')",
+                user.name,id,Integer.parseInt(booking[2]))!=1) throw new Problem(409,"BOOKING_CHANGED","Booking changed");
+            update(c,"DELETE FROM slots WHERE booking=?",id);
+            audit(c,user,"cancel",id,why==null?"Cancelled":why);
+            notice(c,booking[0],id,"CANCELLED","Booking cancelled");
+            return null;
+        });
+    }
+    void reschedule(Accounts.User user,String id,String why,int room,Window w,Integer attendees) throws SQLException {
+        moveSeries(user,id,why,room,w,attendees,false);
+    }
+
+    void moveSeries(Accounts.User user,String id,String why,int room,Window w,Integer attendees,boolean future) throws SQLException {
+        transaction(c -> {
+            authorize(c,user,id,why);
+            String[] current=rows(c,"SELECT series_id,booked_day FROM bookings WHERE id=?",id).get(0);
+            List<String[]> members=Collections.singletonList(new String[]{id,current[1]});
+            if(future && current[0]!=null) members=rows(c,"SELECT id,booked_day FROM bookings WHERE series_id=? AND booked_day>=? AND status IN ('CONFIRMED','PENDING_APPROVAL') ORDER BY booked_day",
+                current[0],java.sql.Date.valueOf(current[1]));
+            // Free the affected instances within this transaction before moving them onto each other's dates.
+            for(String[] member:members) update(c,"DELETE FROM slots WHERE booking=?",member[0]);
+            for(String[] member:members) {
+                long offset=java.time.temporal.ChronoUnit.DAYS.between(LocalDate.parse(current[1]),LocalDate.parse(member[1]));
+                Window target=new Window(w.date.toLocalDate().plusDays(offset),w.start,w.end);
+                validateBooking(target);
+                moveOne(c,user,member[0],why,room,target,attendees);
+            }
             return null;
         });
     }
 
-    void reschedule(Accounts.User user, String id, String legacyKey, String why, int room, Window w) throws SQLException {
-        schedule(c -> {
-            String needs = authorize(c,user,id,legacyKey,"reschedule",why);
-            checkRoom(c,room,w,needs);
-            update(c,"UPDATE bookings SET room=?,booked_day=?,first_min=?,last_min=? WHERE id=?",room,w.date,w.start,w.end,id);
+    private void moveOne(Connection c,Accounts.User user,String id,String why,int room,Window w,Integer attendees) throws SQLException {
+            String[] booking=authorize(c,user,id,why);
+            if(attendees==null && !"0".equals(booking[3]) || attendees!=null && attendees<1)
+                throw new Problem(400,"INVALID_ATTENDEES","Supply a positive attendee count");
+            int count=attendees==null?0:attendees;
+            quota(c,booking[0],w,id);
+            int old=Integer.parseInt(booking[2]);
+            lockRoom(c,Math.min(old,room));
+            if (old!=room) lockRoom(c,Math.max(old,room));
+            checkRoom(c,room,w,booking[1],count);
+            if(update(c,"UPDATE bookings SET room=?,booked_day=?,first_min=?,last_min=?,attendees=? WHERE id=? AND room=? AND status IN ('CONFIRMED','PENDING_APPROVAL')",
+                room,w.date,w.start,w.end,count,id,old)!=1) throw new Problem(409,"BOOKING_CHANGED","Booking changed");
             update(c,"DELETE FROM slots WHERE booking=?",id);
             reserveSlots(c,id,room,w);
-            return null;
-        });
+            String next="1".equals(rows(c,"SELECT approval FROM rooms WHERE id=?",room).get(0)[0])?"PENDING_APPROVAL":"CONFIRMED";
+            update(c,"UPDATE bookings SET status=?,reminded=0 WHERE id=?",next,id);
+            audit(c,user,"reschedule",id,why==null?"Rescheduled":why);
+            notice(c,booking[0],id,"RESCHEDULED","Moved to room "+room+" on "+w.date+" at "+Server.time(Integer.toString(w.start)));
     }
 
     List<String[]> availableRooms(Window w, int people, String rawNeeds) throws SQLException {
         if (people < 1) throw new Problem(400,"people must be positive");
         String needs = equipment(rawNeeds);
-        List<String[]> result = query("SELECT r.id,r.label,r.capacity,r.equipment FROM rooms r WHERE r.enabled=1 AND r.capacity>=? "
-                + "AND NOT EXISTS (SELECT 1 FROM slots s WHERE s.room=r.id AND s.booked_day=? AND s.minute_of_day>=? AND s.minute_of_day<?) "
-                + "AND NOT EXISTS (SELECT 1 FROM maintenance m WHERE m.room=r.id AND m.booked_day=? AND m.first_min<? AND m.last_min>?) "
-                + "ORDER BY r.capacity,r.id",people,w.date,w.start,w.end,w.date,w.end,w.start);
-        result.removeIf(row -> !supports(row[3],needs));
-        return result;
+        try(Connection c=open()) { return search(c,w,people,needs,null,true); }
     }
     List<String[]> rooms() throws SQLException {
-        return query("SELECT id,label,capacity,equipment,enabled FROM rooms ORDER BY id");
+        return query("SELECT id,label,capacity,equipment,enabled,location,description,image_url,approval FROM rooms WHERE deleted=0 ORDER BY id");
     }
     private static List<String[]> times(List<String[]> records) {
         for (String[] row : records) {
@@ -140,15 +205,23 @@ public final class BookingStore extends Database {
         }
         return records;
     }
-    List<String[]> agenda(LocalDate day, String owner) throws SQLException {
-        String sql = "SELECT id,room,first_min,last_min,holder FROM bookings WHERE booked_day=?";
+    List<String[]> agenda(LocalDate day, String owner,boolean includeCancelled) throws SQLException {
+        String sql = "SELECT id,room,first_min,last_min,holder,attendees,status FROM bookings WHERE booked_day=?";
+        if (!includeCancelled) sql+=" AND status<>\u0027CANCELLED\u0027";
         java.sql.Date date = java.sql.Date.valueOf(day);
         String order = " ORDER BY room,first_min";
         return times(owner == null ? query(sql+order,date) : query(sql+" AND owner_name=?"+order,date,owner));
     }
 
-    private static void audit(Connection c, Accounts.User user, String action, String target, String why) throws SQLException {
-        update(c,"INSERT INTO admin_log (actor,operation,target,reason) VALUES (?,?,?,?)",user.name,action,target,reason(why));
+    List<String[]> auditPage(Accounts.User user,Map<String,String> p) throws SQLException {
+        user.requireAdmin();
+        int page=Integer.parseInt(p.getOrDefault("page","1")),size=Integer.parseInt(p.getOrDefault("size","50"));
+        if(page<1 || page>1000000 || size<1 || size>200) throw new Problem(400,"Invalid page or size");
+        List<Object> args=new ArrayList<>();
+        String sql="SELECT at_time,actor,operation,target,reason FROM admin_log WHERE 1=1";
+        if(p.containsKey("from")) { sql+=" AND at_time>=?"; args.add(Timestamp.valueOf(LocalDate.parse(p.get("from")).atStartOfDay())); }
+        if(p.containsKey("to")) { sql+=" AND at_time<?"; args.add(Timestamp.valueOf(LocalDate.parse(p.get("to")).plusDays(1).atStartOfDay())); }
+        return query(sql+" ORDER BY seq DESC OFFSET "+((page-1)*size)+" ROWS FETCH NEXT "+size+" ROWS ONLY",args.toArray());
     }
     List<String[]> auditLog(Accounts.User user) throws SQLException {
         user.requireAdmin();
@@ -158,13 +231,13 @@ public final class BookingStore extends Database {
     private static void rejectAffected(List<String[]> affected) {
         if (!affected.isEmpty()) throw new Problem(409,"Reschedule affected bookings first",affected);
     }
-    private static final String AFFECTED = "SELECT id,holder,booked_day,first_min,last_min FROM bookings WHERE room=? ";
+    private static final String AFFECTED = "SELECT id,holder,booked_day,first_min,last_min FROM bookings WHERE room=? AND status IN ('CONFIRMED','PENDING_APPROVAL','CHECKED_IN') ";
     void setEnabled(Accounts.User user, int id, boolean enabled, String why) throws SQLException {
         user.requireAdmin();
-        schedule(c -> {
-            room(c,id);
+        transaction(c -> {
+            lockRoom(c,id);
             if (!enabled) {
-                LocalDateTime now = LocalDateTime.now();
+                LocalDateTime now = LocalDateTime.now(clock);
                 java.sql.Date today = java.sql.Date.valueOf(now.toLocalDate());
                 rejectAffected(rows(c,AFFECTED+"AND (booked_day>? OR (booked_day=? AND last_min>?)) ORDER BY booked_day,first_min",
                         id,today,today,now.getHour()*60+now.getMinute()));
@@ -176,8 +249,8 @@ public final class BookingStore extends Database {
     }
     String addMaintenance(Accounts.User user, int id, Window w, String why) throws SQLException {
         user.requireAdmin();
-        return schedule(c -> {
-            room(c,id);
+        return transaction(c -> {
+            lockRoom(c,id);
             rejectAffected(rows(c,AFFECTED+"AND booked_day=? AND first_min<? AND last_min>? ORDER BY first_min",id,w.date,w.end,w.start));
             if (!rows(c,"SELECT id FROM maintenance WHERE room=? AND booked_day=? AND first_min<? AND last_min>?",
                     id,w.date,w.end,w.start).isEmpty()) throw new Conflict("Overlapping maintenance");
@@ -189,7 +262,10 @@ public final class BookingStore extends Database {
     }
     void removeMaintenance(Accounts.User user, String id, String why) throws SQLException {
         user.requireAdmin();
-        schedule(c -> {
+        transaction(c -> {
+            List<String[]> blocks=rows(c,"SELECT room FROM maintenance WHERE id=?",id);
+            if(blocks.isEmpty()) throw new Problem(404,"Maintenance not found");
+            lockRoom(c,Integer.parseInt(blocks.get(0)[0]));
             if (update(c,"DELETE FROM maintenance WHERE id=?",id)==0) throw new Problem(404,"Maintenance not found");
             audit(c,user,"remove-maintenance",id,why);
             return null;
@@ -198,5 +274,86 @@ public final class BookingStore extends Database {
     List<String[]> maintenance(LocalDate day) throws SQLException {
         return times(query("SELECT id,room,first_min,last_min,reason FROM maintenance WHERE booked_day=? ORDER BY room,first_min",
                 java.sql.Date.valueOf(day)));
+    }
+
+    void decide(Accounts.User user,String id,boolean approve,String why) throws SQLException {
+        user.requireAdmin();
+        transaction(c -> {
+            String[] b=lifecycleRow(c,id);
+            transition(c,id,"PENDING_APPROVAL",approve?"CONFIRMED":"EXPIRED");
+            if(!approve) update(c,"DELETE FROM slots WHERE booking=?",id);
+            audit(c,user,approve?"approve":"deny",id,why);
+            notice(c,b[0],id,"DECISION",approve?"Booking approved":"Booking declined");
+            return null;
+        });
+    }
+    private static String[] lifecycleRow(Connection c,String id) throws SQLException {
+        List<String[]> b=rows(c,"SELECT owner_name,status,booked_day,first_min,last_min FROM bookings WHERE id=?",id);
+        if(b.isEmpty()) throw new Problem(404,"Booking not found");
+        return b.get(0);
+    }
+    private static void transition(Connection c,String id,String from,String to) throws SQLException {
+        if(update(c,"UPDATE bookings SET status=? WHERE id=? AND status=?",to,id,from)!=1)
+            throw new Problem(409,"INVALID_STATE","Booking state changed");
+    }
+    void checkin(Accounts.User user,String id) throws SQLException {
+        transaction(c -> {
+            String[] b=lifecycleRow(c,id);
+            if(!user.name.equals(b[0])) throw new Problem(403,"Owner required");
+            if("CHECKED_IN".equals(b[1])) return null;
+            LocalDateTime now=LocalDateTime.now(clock);
+            LocalDateTime start=LocalDate.parse(b[2]).atStartOfDay().plusMinutes(Integer.parseInt(b[3]));
+            if(!"CONFIRMED".equals(b[1]) || now.isBefore(start) || !now.isBefore(start.plusMinutes(15)))
+                throw new Problem(409,"INVALID_STATE","Check-in is available in the first 15 minutes");
+            transition(c,id,"CONFIRMED","CHECKED_IN");
+            update(c,"UPDATE bookings SET checked_in_at=CURRENT_TIMESTAMP WHERE id=?",id);
+            audit(c,user,"checkin",id,"Checked in");
+            return null;
+        });
+    }
+    void tick() throws SQLException {
+        LocalDateTime now=LocalDateTime.now(clock);
+        Accounts.User system=new Accounts.User("/system",true);
+        for(String[] item:query("SELECT id FROM bookings WHERE booked_day<=? AND status IN ('PENDING_APPROVAL','CONFIRMED','CHECKED_IN')",java.sql.Date.valueOf(now.toLocalDate()))) {
+            try {
+                transaction(c -> {
+                    String[] b=lifecycleRow(c,item[0]);
+                    LocalDateTime day=LocalDate.parse(b[2]).atStartOfDay();
+                    LocalDateTime start=day.plusMinutes(Integer.parseInt(b[3])), end=day.plusMinutes(Integer.parseInt(b[4]));
+                    String next=null;
+                    if(b[1].equals("CHECKED_IN") && !now.isBefore(end)) next="COMPLETED";
+                    if(b[1].equals("PENDING_APPROVAL") && !now.isBefore(start)) next="EXPIRED";
+                    if(b[1].equals("CONFIRMED") && !now.isBefore(start.plusMinutes(15))) next="NO_SHOW";
+                    if(next!=null) {
+                        transition(c,item[0],b[1],next);
+                        update(c,"DELETE FROM slots WHERE booking=?",item[0]);
+                        if(next.equals("NO_SHOW")) {
+                            update(c,"UPDATE accounts SET strikes=strikes+1 WHERE username=?",b[0]);
+                            update(c,"UPDATE accounts SET strikes=0,suspended_until=? WHERE username=? AND strikes>=3",clock.millis()+604800000L,b[0]);
+                        }
+                        audit(c,system,"state",item[0],next);
+                    } else if(b[1].equals("CONFIRMED") && !now.isBefore(start.minusMinutes(15)) && now.isBefore(start)
+                         && update(c,"UPDATE bookings SET reminded=1 WHERE id=? AND reminded=0 AND status='CONFIRMED'",item[0])==1)
+                        notice(c,b[0],item[0],"REMINDER","Booking starts at "+start);
+                    return null;
+                });
+            } catch(Problem concurrent) { if(!"INVALID_STATE".equals(concurrent.code)) throw concurrent; }
+        }
+    }
+    List<String[]> suggestions(Window w,int people,String needs,int room,boolean times) throws SQLException {
+        List<String[]> found=new ArrayList<>();
+        if(!times) {
+            for(String[] r:availableRooms(w,people,needs)) if(Integer.parseInt(r[0])!=room && found.size()<3) found.add(r);
+        } else {
+            for(int delta=30;delta<=120;delta+=30) for(int sign:new int[]{1,-1}) {
+                int start=w.start+sign*delta,end=w.end+sign*delta;
+                if(start<0 || end>1440 || found.size()>=3) continue;
+                Window slot=new Window(w.date.toLocalDate(),start,end);
+                try { validateBooking(slot); } catch(Problem outside) { continue; }
+                for(String[] r:availableRooms(slot,people,needs)) if(Integer.parseInt(r[0])==room)
+                    found.add(new String[]{Server.time(""+start),Server.time(""+end)});
+            }
+        }
+        return found;
     }
 }

@@ -1,3 +1,7 @@
 /out/
 /data/
 /derby.log
+/target/
+/.build/
+/.env
+/dependency-download.log

@@ -7,7 +7,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import javax.crypto.SecretKeyFactory;
 import javax.crypto.spec.PBEKeySpec;
 
-final class Accounts {
+class Accounts {
     static final class User {
         final String name;
         final boolean admin;
@@ -24,7 +24,17 @@ final class Accounts {
     private final Database db;
     private final SecureRandom random = new SecureRandom();
     private final Map<String, Session> sessions = new ConcurrentHashMap<>();
-    Accounts(Database db) { this.db = db; }
+    private final java.time.Clock clock;
+    private final Map<String,Deque<Long>> attempts = new HashMap<>();
+    Accounts(Database db) { this(db,java.time.Clock.systemUTC()); }
+    Accounts(Database db,java.time.Clock clock) { this.db=db; this.clock=clock; }
+    synchronized void limitIp(String ip,long now) {
+        attempts.values().removeIf(queue -> queue.isEmpty() || queue.getLast()<=now-60000);
+        Deque<Long> queue=attempts.computeIfAbsent(ip,k -> new ArrayDeque<>());
+        while(!queue.isEmpty() && queue.getFirst()<=now-60000) queue.removeFirst();
+        if(queue.size()>=20) throw new Problem(429,"RATE_LIMITED","Try again in one minute");
+        queue.addLast(now);
+    }
 
     private String username(String raw) {
         if (!raw.matches("[A-Za-z0-9_]{3,40}")) throw new Problem(400,"Use 3-40 letters, digits or underscores for username");
@@ -54,29 +64,53 @@ final class Accounts {
         byte[] salt = new byte[16];
         random.nextBytes(salt);
         try (Connection c = db.open()) {
-            Database.update(c,"INSERT INTO accounts VALUES (?,?,?,?)",name,Base64.getEncoder().encodeToString(salt),
+            Database.update(c,"INSERT INTO accounts(username,salt,verifier,is_admin) VALUES (?,?,?,?)",name,Base64.getEncoder().encodeToString(salt),
                     Base64.getEncoder().encodeToString(hash(password,salt)),admin ? 1 : 0);
         } catch (SQLException e) {
-            if ("23505".equals(e.getSQLState())) throw new Problem(409,"Username already exists");
+            if ("23505".equals(e.getSQLState()) || e.getErrorCode()==1062) throw new Problem(409,"Username already exists");
             throw e;
         }
     }
 
-    String login(String raw, String password) throws SQLException {
-        String name = username(raw);
-        List<String[]> records = db.query("SELECT salt,verifier,is_admin FROM accounts WHERE username=?",name);
-        if (records.isEmpty()) throw new Problem(401,"Invalid credentials");
-        String[] record = records.get(0);
-        if (!MessageDigest.isEqual(Base64.getDecoder().decode(record[1]), hash(password,Base64.getDecoder().decode(record[0]))))
-            throw new Problem(401,"Invalid credentials");
+    String login(String raw,String password,String ip) throws SQLException {
+        long now=clock.millis();
+        limitIp(ip,now);
+        String name=username(raw);
+        // Serialize attempts for one account; failures and their audit record commit together.
+        String outcome=db.transaction(c -> {
+            Database.update(c,"UPDATE accounts SET is_admin=is_admin WHERE username=?",name);
+            List<String[]> records=Database.rows(c,"SELECT salt,verifier,is_admin FROM accounts WHERE username=?",name);
+            List<String[]> guard=Database.rows(c,"SELECT failures,locked_until FROM login_guard WHERE username=?",name);
+            long until=guard.isEmpty()?0:Long.parseLong(guard.get(0)[1]);
+            if(until>now) return Long.toString((until-now+999)/1000);
+            if(!records.isEmpty()) {
+                String[] record=records.get(0);
+                if(MessageDigest.isEqual(Base64.getDecoder().decode(record[1]),hash(password,Base64.getDecoder().decode(record[0])))) {
+                    Database.update(c,"DELETE FROM login_guard WHERE username=?",name);
+                    return "1".equals(record[2])?"ADMIN":"EMPLOYEE";
+                }
+            }
+            int failures=guard.isEmpty() || until>0?1:Integer.parseInt(guard.get(0)[0])+1;
+            if(!records.isEmpty()) {
+                Database.update(c,"DELETE FROM login_guard WHERE username=?",name);
+                Database.update(c,"INSERT INTO login_guard VALUES (?,?,?)",name,failures,failures>=5?now+900000:0L);
+            }
+            Database.update(c,"INSERT INTO admin_log(actor,operation,target,reason) VALUES (?,?,?,?)",name,
+                failures==5?"login-lock":"login-failure",name,"Invalid credentials");
+            return "DENIED";
+        });
+        if(outcome.equals("DENIED")) throw new Problem(401,"Invalid credentials");
+        if(!outcome.equals("ADMIN") && !outcome.equals("EMPLOYEE"))
+            throw new Problem(429,"ACCOUNT_LOCKED","Account locked for "+outcome+" seconds");
         sessions.values().removeIf(session -> session.expires <= System.currentTimeMillis());
         byte[] token = new byte[32];
         random.nextBytes(token);
         String value = Base64.getUrlEncoder().withoutPadding().encodeToString(token);
-        sessions.put(value,new Session(new User(name,"1".equals(record[2]))));
+        saveSession(value,new User(name,outcome.equals("ADMIN")));
         return value;
     }
 
+    void saveSession(String token,User user) { sessions.put(token,new Session(user)); }
     User authenticate(String token) {
         Session session = sessions.get(token);
         if (session == null || session.expires <= System.currentTimeMillis()) throw new Problem(401,"Login required");
