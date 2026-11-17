@@ -2,6 +2,10 @@
 
 Java 8、JDBC 和 Derby 实现的单机会议室预约服务。员工登录后可按人数、设备和时段查房，创建、查看、修改或取消自己的预约。管理员管理房间状态、维护窗口和预约代办。服务监听本机 127.0.0.1，预约时间按 Asia/Shanghai 解释。
 
+## 构建与回归测试
+
+在项目根目录使用完整 JDK（Java 8 或 11）和 Maven 3.6.3 或更新的 Maven 3，执行 `mvn verify`。首次构建从 Maven Central 下载 Derby 和测试依赖，生成 `target/roombook-2.0.0.jar`。JUnit 会运行原有业务与迁移测试，以及使用本机随机端口和内存 Derby 的 HTTP 测试。详细结果在 `target/surefire-reports/`。测试覆盖员工匿名日程、越权、时段冲突、改期回滚和过期扫描结果。
+
 ## 启动（Windows PowerShell）
 
 需要 JDK 8、PATH 中的 javac 和 Derby JDBC 驱动。脚本默认读取 JDK 的 db/lib/derby.jar，也可以用环境变量 DERBY_JAR 指向兼容 Java 8 的 derby.jar。
@@ -50,7 +54,7 @@ Invoke-RestMethod "$base/admin/audit" -Headers $ah
 
 ## HTTP 接口
 
-POST 使用 application/x-www-form-urlencoded。除注册、登录外均需 Authorization: Bearer 请求头，查询结果为 JSON。时间参数使用 yyyy-MM-dd 和 HH:mm，开放时间为 09:00–18:00，按半小时预约，区间结束点不占用。
+POST 使用 application/x-www-form-urlencoded。除注册、登录外均需 Authorization: Bearer 请求头，查询结果为 JSON。时间参数使用 yyyy-MM-dd 和 HH:mm，默认开放时间为 09:00–18:00，管理员可按星期或指定日期覆盖，按半小时预约，区间结束点不占用。
 
 | 方法和路径 | 参数或用途 |
 |---|---|
@@ -58,7 +62,7 @@ POST 使用 application/x-www-form-urlencoded。除注册、登录外均需 Auth
 | POST /logout | 空表单，撤销当前 token |
 | GET /rooms | 所有房间、座位、设备及 enabled（布尔值） |
 | GET /availability | date、start、end，可选 people 和 equipment，按容量升序 |
-| GET /bookings、GET /my-bookings | date，查看当天全部预约或当前员工的预约 |
+| GET /bookings、GET /my-bookings | date；公共日程对员工只显示匿名忙闲，管理员可看完整日程。/my-bookings 仅返回本人记录，可加 includeCancelled=true |
 | POST /bookings | room、date、start、end、attendees，可选 equipment，返回 data.id |
 | POST /reschedule | id、room、date、start、end、attendees，保留原设备要求 |
 | POST /cancel | id |
@@ -66,7 +70,23 @@ POST 使用 application/x-www-form-urlencoded。除注册、登录外均需 Auth
 | POST /admin/room-status | room、enabled（true/false）、reason |
 | POST /admin/maintenance | room、date、start、end、reason，返回维护 id |
 | POST /admin/maintenance/remove | id、reason |
-| GET /admin/audit | 管理员查看代办、维护和状态变更记录 |
+| GET /admin/audit | 可选 from、to、page、size，按日期筛选并分页 |
+| POST /bookings/recurring | 创建预约的参数加 rrule，例如 WEEKLY;COUNT=4；整批事务提交 |
+| PUT /bookings/{id} | 改期，scope 默认 THIS，可选 THIS_AND_FUTURE |
+| POST /bookings/{id}/cancel、POST /bookings/{id}/checkin | 取消或签到，使用空表单。签到也支持 POST /checkin 传 id |
+| POST /admin/rooms | 创建或编辑房间，必填 name、capacity、reason；编辑传 id，可设 equipment、location、description、image、approval |
+| POST /admin/rooms/delete | id、reason，有预约历史时返回 ROOM_IN_USE |
+| POST /admin/calendar | kind、reason；weekly 传 room、weekday、start、end；override 传 room、date、start、end；holiday/workday 传 date |
+| POST /admin/decision | id、approve（true/false）、reason，处理待审批预约 |
+| POST /profile/email、GET /notifications | 设置本人邮箱（email），或查看最近 100 条站内通知 |
+| GET /admin/dead-letters、POST /admin/dead-letters/replay | 查看失败邮件，按 id 重新投递 |
+| GET /admin/reports/usage | from、to、granularity（week/month），最多 366 天 |
+
+所有路径也支持 `/api` 前缀。创建与改期须在 30 天内，开始时间允许 5 分钟宽限，每次最多 4 小时，每人每天最多 5 笔有效预约。登录连续失败 5 次后锁定 15 分钟，同一 IP 每分钟最多发起 20 次登录请求。
+
+报表按请求范围裁剪首尾周或月。使用率用已确认、已签到及已完成预约占用的分钟数，除以按当前房间状态和日历计算、扣除维护后的可用分钟数。没有可用分钟时返回 null。
+
+邮件投递需要 Python 3 以及 `ROOMBOOK_SMTP_HOST`、`ROOMBOOK_SMTP_USER`、`ROOMBOOK_SMTP_PASSWORD`、`ROOMBOOK_SMTP_FROM`。可选 `ROOMBOOK_SMTP_PORT` 默认 465，使用 SMTP over TLS。未设置收件邮箱的账号只收站内信。
 
 401 表示需要重新登录或凭证错误，403 表示权限不足，400 表示参数不合法。管理员替他人改期或取消必须提交 reason，操作与审计记录同事务提交。409 表示时段冲突、设备不满足、房间停用等业务冲突，具体原因在 code 和 message 字段中。
 

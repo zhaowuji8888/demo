@@ -86,6 +86,7 @@ public class StoreTest {
         expect(409,() -> db.book(bob,1,new BookingStore.Window(later.date.toLocalDate(),570,630),"",1));
         String adjacent = db.book(bob,1,new BookingStore.Window(later.date.toLocalDate(),570,600),"",1);
         db.cancel(bob,adjacent,null);
+        StaleScanTest.run();
         Acceptance.run();
         System.out.println("PASS login, ownership, audit, equipment, closures, rollback, legacy and concurrent booking");
     }

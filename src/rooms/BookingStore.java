@@ -311,38 +311,70 @@ public final class BookingStore extends RoomCatalog {
             return null;
         });
     }
-    void tick() throws SQLException {
-        LocalDateTime now=LocalDateTime.now(clock);
-        Accounts.User system=new Accounts.User("/system",true);
-        for(String[] item:query("SELECT id FROM bookings WHERE booked_day<=? AND status IN ('PENDING_APPROVAL','CONFIRMED','CHECKED_IN')",java.sql.Date.valueOf(now.toLocalDate()))) {
-            try {
-                transaction(c -> {
-                    String[] b=lifecycleRow(c,item[0]);
-                    LocalDateTime day=LocalDate.parse(b[2]).atStartOfDay();
-                    LocalDateTime start=day.plusMinutes(Integer.parseInt(b[3])), end=day.plusMinutes(Integer.parseInt(b[4]));
-                    String next=null;
-                    if(b[1].equals("CHECKED_IN") && !now.isBefore(end)) next="COMPLETED";
-                    if(b[1].equals("PENDING_APPROVAL") && !now.isBefore(start)) next="EXPIRED";
-                    if(b[1].equals("CONFIRMED")) {
-                        boolean requiresCheckin="1".equals(b[5]);
-                        if(requiresCheckin && !now.isBefore(start.plusMinutes(15))) next="NO_SHOW";
-                        if(!requiresCheckin && !now.isBefore(end)) next="COMPLETED";
-                    }
-                    if(next!=null) {
-                        transition(c,item[0],b[1],next);
-                        update(c,"DELETE FROM slots WHERE booking=?",item[0]);
-                        if(next.equals("NO_SHOW")) {
-                            update(c,"UPDATE accounts SET strikes=strikes+1 WHERE username=?",b[0]);
-                            update(c,"UPDATE accounts SET strikes=0,suspended_until=? WHERE username=? AND strikes>=3",clock.millis()+604800000L,b[0]);
-                        }
-                        audit(c,system,"state",item[0],next);
-                    } else if(b[1].equals("CONFIRMED") && !now.isBefore(start.minusMinutes(15)) && now.isBefore(start)
-                         && update(c,"UPDATE bookings SET reminded=1 WHERE id=? AND reminded=0 AND status='CONFIRMED'",item[0])==1)
-                        notice(c,b[0],item[0],"REMINDER","Booking starts at "+start);
-                    return null;
-                });
-            } catch(Problem concurrent) { if(!"INVALID_STATE".equals(concurrent.code)) throw concurrent; }
+    static final class ScanEntry {
+        final String id, owner, status;
+        final LocalDate day;
+        final int firstMinute, lastMinute;
+        final boolean requiresCheckin;
+
+        ScanEntry(String[] row) {
+            id = row[0];
+            owner = row[1];
+            status = row[2];
+            day = LocalDate.parse(row[3]);
+            firstMinute = Integer.parseInt(row[4]);
+            lastMinute = Integer.parseInt(row[5]);
+            requiresCheckin = "1".equals(row[6]);
         }
+
+        String dueStatus(LocalDateTime now) {
+            LocalDateTime start = day.atStartOfDay().plusMinutes(firstMinute);
+            LocalDateTime end = day.atStartOfDay().plusMinutes(lastMinute);
+            if ("PENDING_APPROVAL".equals(status) && !now.isBefore(start)) return "EXPIRED";
+            if ("CONFIRMED".equals(status) && requiresCheckin && !now.isBefore(start.plusMinutes(15))) return "NO_SHOW";
+            if (("CHECKED_IN".equals(status) || "CONFIRMED".equals(status) && !requiresCheckin) && !now.isBefore(end)) return "COMPLETED";
+            return null;
+        }
+    }
+
+    List<String[]> scanCandidates(LocalDate day) throws SQLException {
+        return query("SELECT id,owner_name,status,booked_day,first_min,last_min,checkin_required FROM bookings "+
+                "WHERE booked_day<=? AND status IN ('PENDING_APPROVAL','CONFIRMED','CHECKED_IN')",java.sql.Date.valueOf(day));
+    }
+
+    void tick() throws SQLException {
+        LocalDateTime now = LocalDateTime.now(clock);
+        for (String[] row : scanCandidates(now.toLocalDate())) applyScan(new ScanEntry(row),now);
+    }
+
+    // A reschedule can preserve CONFIRMED. Match the entire time window before applying its consequences.
+    private static final String SCANNED_SLOT = " WHERE id=? AND status=? AND booked_day=? AND first_min=? AND last_min=?";
+
+    void applyScan(ScanEntry booking,LocalDateTime now) throws SQLException {
+        String next = booking.dueStatus(now);
+        LocalDateTime start = booking.day.atStartOfDay().plusMinutes(booking.firstMinute);
+        boolean reminderDue = "CONFIRMED".equals(booking.status) && !now.isBefore(start.minusMinutes(15)) && now.isBefore(start);
+        if (next == null && !reminderDue) return;
+        java.sql.Date date = java.sql.Date.valueOf(booking.day);
+        transaction(c -> {
+            if (next == null) {
+                if (update(c,"UPDATE bookings SET reminded=1"+SCANNED_SLOT+" AND reminded=0",
+                        booking.id,booking.status,date,booking.firstMinute,booking.lastMinute)==1)
+                    notice(c,booking.owner,booking.id,"REMINDER","Booking starts at "+start);
+                return null;
+            }
+            int changed = update(c,"UPDATE bookings SET status=?"+SCANNED_SLOT,next,booking.id,booking.status,
+                    date,booking.firstMinute,booking.lastMinute);
+            if (changed == 0) return null;
+            update(c,"DELETE FROM slots WHERE booking=?",booking.id);
+            if ("NO_SHOW".equals(next)) {
+                update(c,"UPDATE accounts SET strikes=strikes+1 WHERE username=?",booking.owner);
+                update(c,"UPDATE accounts SET strikes=0,suspended_until=? WHERE username=? AND strikes>=3",
+                        clock.millis()+604800000L,booking.owner);
+            }
+            audit(c,new Accounts.User("/system",true),"state",booking.id,next);
+            return null;
+        });
     }
     List<String[]> suggestions(Window w,int people,String needs,int room,boolean times) throws SQLException {
         List<String[]> found=new ArrayList<>();
