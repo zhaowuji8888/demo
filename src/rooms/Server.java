@@ -56,7 +56,7 @@ public class Server {
         return p;
     }
     static String field(Map<String,String> p,String name) {
-        if(!p.containsKey(name)) throw new IllegalArgumentException("Missing field: "+name);
+        if(!p.containsKey(name)) throw new Problem(400,"INVALID_REQUEST","Missing field: "+name);
         return p.get(name);
     }
     static String time(String raw) {

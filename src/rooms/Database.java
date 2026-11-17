@@ -124,6 +124,11 @@ class Database {
                 migrateCheckinPolicy(c);
                 update(c,"INSERT INTO schema_history(version) VALUES (4)");
             }
+            if (rows(c,"SELECT version FROM schema_history WHERE version=5").isEmpty()) {
+                update(c,"UPDATE bookings SET status='REJECTED' WHERE status='EXPIRED' AND EXISTS "+
+                        "(SELECT 1 FROM admin_log a WHERE a.operation='deny' AND a.target=bookings.id)");
+                update(c,"INSERT INTO schema_history(version) VALUES (5)");
+            }
             return null;
         });
     }

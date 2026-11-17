@@ -14,12 +14,13 @@ import static org.junit.Assert.*;
 public class HttpSuite {
     private static final ObjectMapper JSON = new ObjectMapper();
     private HttpServer server;
+    private final Acceptance.Time clock = new Acceptance.Time();
+    private BookingStore db;
     private Accounts accounts;
     private String alice, bob, day;
 
     @Before public void start() throws Exception {
-        Acceptance.Time clock = new Acceptance.Time();
-        BookingStore db = new BookingStore("jdbc:derby:memory:http"+UUID.randomUUID()+";create=true",clock);
+        db = new BookingStore("jdbc:derby:memory:http"+UUID.randomUUID()+";create=true",clock);
         accounts = new Accounts(db,clock);
         server = HttpServer.create(new InetSocketAddress("127.0.0.1",0),0);
         server.createContext("/",exchange -> Server.handle(db,accounts,exchange));
@@ -32,6 +33,10 @@ public class HttpSuite {
     @After public void stop() { if (server != null) server.stop(0); }
 
     private JsonNode request(String method,String path,String token,String form,int expected,String code) throws Exception {
+        return response(method,path,token,form,expected,code).get("data");
+    }
+
+    private JsonNode response(String method,String path,String token,String form,int expected,String code) throws Exception {
         URL url = new URL("http://127.0.0.1:"+server.getAddress().getPort()+"/api"+path);
         HttpURLConnection connection = (HttpURLConnection)url.openConnection(Proxy.NO_PROXY);
         try {
@@ -51,7 +56,7 @@ public class HttpSuite {
                 assertEquals(code,response.path("code").asText());
                 assertFalse(response.path("traceId").asText().isEmpty());
                 assertTrue(response.has("message") && response.has("data"));
-                return response.get("data");
+                return response;
             }
         } finally { connection.disconnect(); }
     }
@@ -64,6 +69,52 @@ public class HttpSuite {
 
     private String booking(int room) {
         return "date="+day+"&room="+room+"&start=10:00&end=11:00&attendees=2";
+    }
+
+    private String loginAdmin() throws Exception {
+        accounts.bootstrap("http-admin-password");
+        return request("POST","/login",null,"username=admin&password=http-admin-password",200,"OK").get("token").asText();
+    }
+
+    @Test public void decisionDistinguishesRejectionFromTimeout() throws Exception {
+        String admin = loginAdmin();
+        request("POST","/admin/rooms",admin,"id=1&name=Cedar&capacity=4&approval=true&reason=policy",200,"OK");
+        String id = request("POST","/bookings",alice,booking(1),201,"OK").get("id").asText();
+        String deny = "id="+id+"&approve=false";
+        JsonNode error = response("POST","/admin/decision",admin,deny,400,"INVALID_REQUEST");
+        assertEquals("Missing field: reason", error.get("message").asText());
+        request("POST","/admin/decision",admin,deny+"&reason=unavailable",200,"OK");
+        assertEquals("REJECTED",request("GET","/my-bookings?date="+day,alice,null,200,"OK").get(0).get("status").asText());
+        request("POST","/bookings",bob,booking(1),201,"OK");
+        clock.now = LocalDate.parse(day).atTime(10,0).atZone(clock.getZone()).toInstant();
+        db.tick();
+        assertEquals("EXPIRED",request("GET","/my-bookings?date="+day,bob,null,200,"OK").get(0).get("status").asText());
+        assertTrue(db.query("SELECT booking FROM slots WHERE room=1").isEmpty());
+    }
+
+    @Test public void missedCheckinsNotifyOwnerOnceAndGiveExactSuspensionEnd() throws Exception {
+        for (int i=0; i<3; i++) {
+            String id = request("POST","/bookings",alice,booking(1),201,"OK").get("id").asText();
+            clock.now = LocalDate.parse(day).atTime(10,15).atZone(clock.getZone()).toInstant();
+            db.tick();
+            db.tick();
+            int matches = 0;
+            for (JsonNode notice : request("GET","/notifications",alice,null,200,"OK")) {
+                if (!"NO_SHOW".equals(notice.path("kind").asText()) || !id.equals(notice.path("booking").asText())) continue;
+                matches++;
+                String message = notice.get("message").asText();
+                assertTrue(message.contains(day+"T10:00"));
+                assertEquals(i==2,message.contains("suspended until"));
+                if (i==2) assertTrue(message.contains(clock.now.plus(java.time.Duration.ofDays(7)).atZone(clock.getZone()).toString()));
+            }
+            assertEquals(1,matches);
+            day = LocalDate.parse(day).plusDays(1).toString();
+        }
+        assertEquals(0,request("GET","/notifications",bob,null,200,"OK").size());
+        request("POST","/bookings",alice,booking(1),403,"BOOKING_SUSPENDED");
+        clock.now = clock.now.plus(java.time.Duration.ofDays(7));
+        day = LocalDate.now(clock).plusDays(1).toString();
+        request("POST","/bookings",alice,booking(1),201,"OK");
     }
 
     @Test public void roleAndPrivacyContract() throws Exception {
@@ -85,8 +136,7 @@ public class HttpSuite {
         request("POST","/bookings",alice,booking(1),201,"OK");
         request("GET",path,null,null,401,"UNAUTHORIZED");
         request("GET",path,bob,null,403,"FORBIDDEN");
-        accounts.bootstrap("http-admin-password");
-        String admin = request("POST","/login",null,"username=admin&password=http-admin-password",200,"OK").get("token").asText();
+        String admin = loginAdmin();
         JsonNode report = request("GET",path,admin,null,200,"OK");
         assertEquals(1, report.size());
         JsonNode room = report.get(0).path("rooms").get(0);

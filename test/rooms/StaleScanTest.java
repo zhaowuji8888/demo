@@ -22,5 +22,6 @@ final class StaleScanTest {
         StoreTest.check("CONFIRMED".equals(db.agenda(tomorrow,"alice",false).get(0)[6]),"stale scan incorrectly penalized rescheduled booking");
         StoreTest.check(db.query("SELECT minute_of_day FROM slots WHERE booking=? AND booked_day=?",id,java.sql.Date.valueOf(tomorrow)).size()==2,"rescheduled slots retained");
         StoreTest.check(db.query("SELECT username FROM accounts WHERE username='alice' AND strikes=0 AND suspended_until=0").size()==1,"no penalty after reschedule");
+        StoreTest.check(db.query("SELECT id FROM notices WHERE booking=? AND kind='NO_SHOW'",id).isEmpty(),"no missed check-in notice after reschedule");
     }
 }

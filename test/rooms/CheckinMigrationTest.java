@@ -14,7 +14,10 @@ final class CheckinMigrationTest {
         accounts.register("mixed","a-secure-user-password");
         initial.transaction(c -> {
             Database.update(c,"ALTER TABLE bookings DROP COLUMN checkin_required RESTRICT");
-            Database.update(c,"DELETE FROM schema_history WHERE version=4");
+            Database.update(c,"DELETE FROM schema_history WHERE version>=4");
+            seed(c,"denied","/legacy","EXPIRED",today,false);
+            seed(c,"timed-out","/legacy","EXPIRED",today,false);
+            Database.update(c,"INSERT INTO admin_log(operation,target,reason) VALUES ('deny','denied','Unavailable')");
             for(int i=0;i<3;i++) {
                 seed(c,"old"+i,"tester","CONFIRMED",today.minusDays(i+1),false);
                 seed(c,"penalty"+i,"mixed","NO_SHOW",today.minusDays(i+1),false);
@@ -29,6 +32,8 @@ final class CheckinMigrationTest {
         for(int restart=0;restart<2;restart++) {
             BookingStore db=new BookingStore(url,clock);
             db.tick();
+            StoreTest.check(db.query("SELECT id FROM bookings WHERE id='denied' AND status='REJECTED'").size()==1,"restore documented rejection");
+            StoreTest.check(db.query("SELECT id FROM bookings WHERE id='timed-out' AND status='EXPIRED'").size()==1,"preserve expiry without denial");
             StoreTest.check(db.query("SELECT id FROM bookings WHERE owner_name='tester' AND status='COMPLETED'").size()==3,"historical meetings completed");
             StoreTest.check(db.query("SELECT minute_of_day FROM slots WHERE booking='ongoing'").size()==1,"ongoing legacy meeting retains slot");
             StoreTest.check(db.query("SELECT username FROM accounts WHERE username='tester' AND strikes=0 AND suspended_until=0").size()==1,"legacy meetings carry no penalty");

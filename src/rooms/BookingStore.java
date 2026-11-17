@@ -280,7 +280,7 @@ public final class BookingStore extends RoomCatalog {
         user.requireAdmin();
         transaction(c -> {
             String[] b=lifecycleRow(c,id);
-            transition(c,id,"PENDING_APPROVAL",approve?"CONFIRMED":"EXPIRED");
+            transition(c,id,"PENDING_APPROVAL",approve?"CONFIRMED":"REJECTED");
             if(!approve) update(c,"DELETE FROM slots WHERE booking=?",id);
             audit(c,user,approve?"approve":"deny",id,why);
             notice(c,b[0],id,"DECISION",approve?"Booking approved":"Booking declined");
@@ -369,8 +369,12 @@ public final class BookingStore extends RoomCatalog {
             update(c,"DELETE FROM slots WHERE booking=?",booking.id);
             if ("NO_SHOW".equals(next)) {
                 update(c,"UPDATE accounts SET strikes=strikes+1 WHERE username=?",booking.owner);
-                update(c,"UPDATE accounts SET strikes=0,suspended_until=? WHERE username=? AND strikes>=3",
-                        clock.millis()+604800000L,booking.owner);
+                Instant until = Instant.ofEpochMilli(clock.millis()).plus(Duration.ofDays(7));
+                int suspended = update(c,"UPDATE accounts SET strikes=0,suspended_until=? WHERE username=? AND strikes>=3",
+                        until.toEpochMilli(),booking.owner);
+                String message = "Missed check-in for the booking starting at "+start+".";
+                if (suspended == 1) message += " After three no-shows, new bookings are suspended until "+until.atZone(ZONE)+".";
+                notice(c,booking.owner,booking.id,"NO_SHOW",message);
             }
             audit(c,new Accounts.User("/system",true),"state",booking.id,next);
             return null;
