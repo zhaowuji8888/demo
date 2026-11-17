@@ -92,6 +92,58 @@ public class HttpSuite {
         assertTrue(db.query("SELECT booking FROM slots WHERE room=1").isEmpty());
     }
 
+    @Test public void approvalClosesAtStartEvenWhenTheScannerHasNotRun() throws Exception {
+        String admin = loginAdmin();
+        request("POST","/admin/rooms",admin,"id=1&name=Cedar&capacity=4&approval=true&reason=policy",200,"OK");
+        String onTime = request("POST","/bookings",alice,booking(1),201,"OK").get("id").asText();
+        String late = request("POST","/bookings",bob,"date="+day+"&room=1&start=11:00&end=12:00&attendees=2",201,"OK").get("id").asText();
+        LocalDate meetingDay = LocalDate.parse(day);
+        clock.now = meetingDay.atTime(9,59).atZone(clock.getZone()).toInstant();
+        admin = loginAdmin();
+        request("POST","/admin/decision",admin,"id="+onTime+"&approve=true&reason=reviewed",200,"OK");
+        clock.now = meetingDay.atTime(10,0).atZone(clock.getZone()).toInstant();
+        db.checkin(new Accounts.User("alice",false),onTime);
+        for (int minute : new int[]{0,16}) {
+            clock.now = meetingDay.atTime(11,minute).atZone(clock.getZone()).toInstant();
+            request("POST","/admin/decision",admin,"id="+late+"&approve=true&reason=reviewed",409,"APPROVAL_CLOSED");
+        }
+        assertEquals("PENDING_APPROVAL",db.query("SELECT status FROM bookings WHERE id=?",late).get(0)[0]);
+        db.tick();
+        assertEquals("EXPIRED",db.query("SELECT status FROM bookings WHERE id=?",late).get(0)[0]);
+        assertEquals("0",db.query("SELECT strikes FROM accounts WHERE username='bobby'").get(0)[0]);
+        assertTrue(db.query("SELECT id FROM notices WHERE booking=? AND kind IN ('DECISION','NO_SHOW')",late).isEmpty());
+        assertTrue(db.query("SELECT booking FROM slots WHERE booking=?",late).isEmpty());
+    }
+
+    @Test public void calendarConflictsRespectOverridesAndPreserveExistingBookings() throws Exception {
+        String admin = loginAdmin();
+        String cedar = request("POST","/bookings",alice,booking(1),201,"OK").get("id").asText();
+        String maple = request("POST","/bookings",bob,booking(2),201,"OK").get("id").asText();
+        int weekday = LocalDate.parse(day).getDayOfWeek().getValue();
+        String weekly = "kind=weekly&room=1&weekday="+weekday+"&start=11:00&end=18:00&reason=hours";
+        JsonNode conflict = request("POST","/admin/calendar",admin,weekly,409,"CONFLICT").path("conflicts").get(0);
+        assertEquals(cedar,conflict.path("id").asText());
+        assertEquals(600,conflict.path("startMinute").intValue());
+        assertTrue(db.query("SELECT room FROM room_hours WHERE room=1").isEmpty());
+
+        String override = "kind=override&room=1&date="+day+"&reason=hours&end=18:00&start=";
+        request("POST","/admin/calendar",admin,override+"09:00",200,"OK");
+        request("POST","/admin/calendar",admin,weekly,200,"OK");
+        String holiday = "kind=holiday&date="+day+"&reason=closed";
+        JsonNode conflicts = request("POST","/admin/calendar",admin,holiday,409,"CONFLICT").path("conflicts");
+        assertEquals(1,conflicts.size());
+        assertEquals(maple,conflicts.get(0).path("id").asText());
+        assertTrue(db.query("SELECT booked_day FROM holidays").isEmpty());
+
+        request("POST","/bookings/"+maple+"/cancel",bob,"",200,"OK");
+        request("POST","/admin/calendar",admin,holiday,200,"OK");
+        conflicts = request("POST","/admin/calendar",admin,override+"11:00",409,"CONFLICT").path("conflicts");
+        assertEquals(1,conflicts.size());
+        assertEquals(cedar,conflicts.get(0).path("id").asText());
+        assertEquals("540",db.query("SELECT opens FROM day_override WHERE room=1").get(0)[0]);
+        assertEquals(3,db.query("SELECT seq FROM admin_log WHERE operation LIKE 'calendar-%'").size());
+    }
+
     @Test public void missedCheckinsNotifyOwnerOnceAndGiveExactSuspensionEnd() throws Exception {
         for (int i=0; i<3; i++) {
             String id = request("POST","/bookings",alice,booking(1),201,"OK").get("id").asText();

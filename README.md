@@ -86,13 +86,16 @@ POST 使用 application/x-www-form-urlencoded。除注册、登录外均需 Auth
 
 报表按请求范围裁剪首尾周或月。可用分钟按当前房间状态和开放日历计算，并扣除维护时段。已订分钟只累计可用时段中已确认、已签到或已完成的预约。使用率等于已订分钟除以可用分钟；可用分钟为零时返回 `null`。
 
+爽约率以要求签到且签到结果已确定的预约为分母，包括 `CHECKED_IN`、`COMPLETED` 和 `NO_SHOW`。分子为其中的 `NO_SHOW`。分母为零时，`noShowRate` 返回 `null`。预约总数 `bookings` 包含统计区间内的所有状态。
+
 邮件投递需要 Python 3 以及 `ROOMBOOK_SMTP_HOST`、`ROOMBOOK_SMTP_USER`、`ROOMBOOK_SMTP_PASSWORD`、`ROOMBOOK_SMTP_FROM`。可选 `ROOMBOOK_SMTP_PORT` 默认 465，使用 SMTP over TLS。未设置收件邮箱的账号只收站内信。
 
 401 表示需要重新登录或凭证错误，403 表示权限不足，400 表示参数不合法。管理员替他人改期或取消必须提交 reason，操作与审计记录同事务提交。409 表示时段冲突、设备不满足、房间停用等业务冲突，具体原因在 code 和 message 字段中。
 
 ## 数据与并发规则
 
-- 管理员拒绝预约后，预约状态为 `REJECTED`。到会议开始仍待审批的预约在扫描后变为 `EXPIRED`。升级旧库时，有拒绝审计记录的过期预约会更正为 `REJECTED`。
+- 管理员可在会议开始前批准待审批预约。从开始时刻起，批准请求返回 HTTP 409 和 `APPROVAL_CLOSED`，待审批预约由扫描任务标记为 `EXPIRED`。管理员拒绝预约时，状态为 `REJECTED`。升级旧库时，有拒绝审计记录的过期预约会更正为 `REJECTED`。
+- 按周开放时间、指定日期开放时间或节假日规则变更时，若新规则会影响尚未结束的有效预约，接口返回 HTTP 409 和 `data.conflicts` 预约清单。指定日期的开放时间优先于节假日和按周规则。
 - 每次爽约都会给预约人发一条 `NO_SHOW` 站内通知。触发七天限制的那条通知会写明恢复预约的具体时间（上海时区）。在 `GET /notifications` 可查看本人通知。
 - 缺少必填字段时，接口返回 HTTP 400 和 `INVALID_REQUEST`。例如管理员审批时漏填 `reason`，响应的 `message` 为 `Missing field: reason`。
 - 升级前没有签到要求的预约免签到。会议结束后自动归档，仍计入预约总数，但不计入爽约率的分子或分母。新版创建的预约要求在开始后 15 分钟内签到，每累计三次爽约限制预约七天。

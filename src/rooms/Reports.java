@@ -92,9 +92,10 @@ final class Reports {
                     }
                     int[] counts = day.users.computeIfAbsent(r.getString(5), owner -> new int[3]);
                     counts[0]++;
-                    if (r.getInt(7) == 1) {
+                    boolean noShow = "NO_SHOW".equals(status);
+                    if (r.getInt(7) == 1 && (noShow || "CHECKED_IN".equals(status) || "COMPLETED".equals(status))) {
                         counts[2]++;
-                        if ("NO_SHOW".equals(status)) counts[1]++;
+                        if (noShow) counts[1]++;
                     }
                 }
             }

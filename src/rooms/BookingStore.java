@@ -6,9 +6,8 @@ import java.util.*;
 
 public final class BookingStore extends RoomCatalog {
     static final ZoneId ZONE = ZoneId.of("Asia/Shanghai");
-    final Clock clock;
     BookingStore(String url) throws SQLException { this(url,Clock.system(ZONE)); }
-    BookingStore(String url,Clock clock) throws SQLException { super(url); this.clock=clock.withZone(ZONE); migrate(); }
+    BookingStore(String url,Clock clock) throws SQLException { super(url,clock.withZone(ZONE)); migrate(); }
 
     void validateBooking(Window w) {
         LocalDateTime now = LocalDateTime.now(clock);
@@ -18,7 +17,7 @@ public final class BookingStore extends RoomCatalog {
             throw new Problem(400,"TIME_OUT_OF_RANGE","Book up to 30 days ahead for 30 minutes to 4 hours");
     }
 
-    BookingStore(javax.sql.DataSource source,Clock clock) { super(""); this.source=source; this.clock=clock.withZone(ZONE); }
+    BookingStore(javax.sql.DataSource source,Clock clock) { super("",clock.withZone(ZONE)); this.source=source; }
     static final class Conflict extends Problem {
         Conflict(String message) { super(409,message); }
     }
@@ -228,10 +227,6 @@ public final class BookingStore extends RoomCatalog {
         return query("SELECT at_time,actor,operation,target,reason FROM admin_log ORDER BY seq DESC");
     }
 
-    private static void rejectAffected(List<String[]> affected) {
-        if (!affected.isEmpty()) throw new Problem(409,"Reschedule affected bookings first",affected);
-    }
-    private static final String AFFECTED = "SELECT id,holder,booked_day,first_min,last_min FROM bookings WHERE room=? AND status IN ('CONFIRMED','PENDING_APPROVAL','CHECKED_IN') ";
     void setEnabled(Accounts.User user, int id, boolean enabled, String why) throws SQLException {
         user.requireAdmin();
         transaction(c -> {
@@ -279,7 +274,16 @@ public final class BookingStore extends RoomCatalog {
     void decide(Accounts.User user,String id,boolean approve,String why) throws SQLException {
         user.requireAdmin();
         transaction(c -> {
+            if (approve) {
+                // Lock the row before checking the deadline against the current booking window.
+                update(c,"UPDATE bookings SET status=status WHERE id=?",id);
+            }
             String[] b=lifecycleRow(c,id);
+            if (approve && "PENDING_APPROVAL".equals(b[1])) {
+                LocalDateTime start = LocalDate.parse(b[2]).atStartOfDay().plusMinutes(Integer.parseInt(b[3]));
+                if (!LocalDateTime.now(clock).isBefore(start))
+                    throw new Problem(409,"APPROVAL_CLOSED","Approval closes when the meeting starts");
+            }
             transition(c,id,"PENDING_APPROVAL",approve?"CONFIRMED":"REJECTED");
             if(!approve) update(c,"DELETE FROM slots WHERE booking=?",id);
             audit(c,user,approve?"approve":"deny",id,why);

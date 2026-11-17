@@ -5,7 +5,13 @@ import java.time.*;
 import java.util.*;
 
 class RoomCatalog extends Database {
-    RoomCatalog(String url) { super(url); }
+    final Clock clock;
+    RoomCatalog(String url,Clock clock) { super(url); this.clock=clock; }
+
+    static final String AFFECTED = "SELECT id,holder,booked_day,first_min,last_min FROM bookings WHERE room=? AND status IN ('CONFIRMED','PENDING_APPROVAL','CHECKED_IN') ";
+    static void rejectAffected(List<String[]> affected) {
+        if (!affected.isEmpty()) throw new Problem(409,"Reschedule affected bookings first",affected);
+    }
 
     static void lockRoom(Connection c,int id) throws SQLException {
         List<String[]> current=rows(c,"SELECT version FROM rooms WHERE id=? AND deleted=0",id);
@@ -63,15 +69,27 @@ class RoomCatalog extends Database {
         transaction(c -> {
             if(kind.equals("holiday") || kind.equals("workday")) {
                 if(date==null) throw new Problem(400,"Date required");
-                for(String[] room:rows(c,"SELECT id FROM rooms WHERE deleted=0 ORDER BY id")) lockRoom(c,Integer.parseInt(room[0]));
+                // Keep the room set stable while applying a rule that covers every room.
+                c.setTransactionIsolation(Connection.TRANSACTION_SERIALIZABLE);
+                List<String[]> rooms=rows(c,"SELECT id FROM rooms WHERE deleted=0 ORDER BY id");
+                for(String[] room:rooms) lockRoom(c,Integer.parseInt(room[0]));
+                if(kind.equals("holiday")) {
+                    LocalDateTime now=LocalDateTime.now(clock);
+                    List<String[]> affected=new ArrayList<>();
+                    for(String[] room:rooms)
+                        affected.addAll(calendarConflicts(c,Integer.parseInt(room[0]),kind,date,weekday,opens,closes,now));
+                    rejectAffected(affected);
+                }
                 update(c,"DELETE FROM holidays WHERE booked_day=?",java.sql.Date.valueOf(date));
                 if(kind.equals("holiday")) update(c,"INSERT INTO holidays VALUES (?)",java.sql.Date.valueOf(date));
             } else {
                 lockRoom(c,id);
                 if(kind.equals("weekly") && weekday>=1 && weekday<=7) {
+                    rejectAffected(calendarConflicts(c,id,kind,date,weekday,opens,closes,LocalDateTime.now(clock)));
                     update(c,"DELETE FROM room_hours WHERE room=? AND weekday=?",id,weekday);
                     update(c,"INSERT INTO room_hours VALUES (?,?,?,?)",id,weekday,opens,closes);
                 } else if(kind.equals("override") && date!=null) {
+                    rejectAffected(calendarConflicts(c,id,kind,date,weekday,opens,closes,LocalDateTime.now(clock)));
                     update(c,"DELETE FROM day_override WHERE room=? AND booked_day=?",id,java.sql.Date.valueOf(date));
                     update(c,"INSERT INTO day_override VALUES (?,?,?,?)",id,java.sql.Date.valueOf(date),opens,closes);
                 } else throw new Problem(400,"Invalid calendar rule");
@@ -79,6 +97,29 @@ class RoomCatalog extends Database {
             audit(c,user,"calendar-"+kind,Integer.toString(id),why);
             return null;
         });
+    }
+
+    private static List<String[]> calendarConflicts(Connection c,int room,String kind,LocalDate date,
+            int weekday,int opens,int closes,LocalDateTime now) throws SQLException {
+        java.sql.Date today=java.sql.Date.valueOf(now.toLocalDate());
+        StringBuilder sql=new StringBuilder(AFFECTED)
+                .append("AND (booked_day>? OR (booked_day=? AND last_min>?)) ");
+        List<Object> args=new ArrayList<>(Arrays.asList(room,today,today,now.getHour()*60+now.getMinute()));
+        if(date!=null && !kind.equals("weekly")) {
+            sql.append("AND booked_day=? ");
+            args.add(java.sql.Date.valueOf(date));
+        }
+        if(!kind.equals("holiday")) {
+            sql.append("AND (first_min<? OR last_min>?) ");
+            Collections.addAll(args,opens,closes);
+        }
+        if(!kind.equals("override"))
+            sql.append("AND NOT EXISTS (SELECT 1 FROM day_override d WHERE d.room=bookings.room AND d.booked_day=bookings.booked_day) ");
+        if(kind.equals("weekly"))
+            sql.append("AND NOT EXISTS (SELECT 1 FROM holidays h WHERE h.booked_day=bookings.booked_day) ");
+        List<String[]> affected=rows(c,sql.append("ORDER BY booked_day,first_min,id").toString(),args.toArray());
+        if(kind.equals("weekly")) affected.removeIf(b -> LocalDate.parse(b[2]).getDayOfWeek().getValue()!=weekday);
+        return affected;
     }
 
     static List<String[]> search(Connection c, BookingStore.Window w,int people,String needs,Integer room,boolean checkSlots) throws SQLException {

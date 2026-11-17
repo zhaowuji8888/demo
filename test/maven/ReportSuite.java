@@ -50,6 +50,39 @@ public class ReportSuite {
         assertEquals(2,months.get(1).path("users").get(0).get("bookings").intValue());
     }
 
+    @Test public void noShowRateUsesOnlyDeterminedRequiredCheckins() throws Exception {
+        Acceptance.Time clock = new Acceptance.Time();
+        BookingStore store = new BookingStore("jdbc:derby:memory:noShowRate;create=true",clock);
+        LocalDate today = LocalDate.now(clock);
+        java.sql.Date past = java.sql.Date.valueOf(today.minusDays(1));
+        java.sql.Date current = java.sql.Date.valueOf(today);
+        java.sql.Date future = java.sql.Date.valueOf(today.plusDays(1));
+        store.transaction(c -> {
+            Database.update(c,"INSERT INTO accounts (username,salt,verifier,is_admin) VALUES ('alice','-','-',0),('bob','-','-',0)");
+            Database.update(c,"INSERT INTO bookings(id,room,booked_day,first_min,last_min,holder,owner_name,status,checkin_required) "+
+                    "VALUES ('miss',1,?,540,570,'alice','alice','NO_SHOW',1),"+
+                    "('done',1,?,540,570,'alice','alice','COMPLETED',1),"+
+                    "('present',1,?,600,660,'alice','alice','CHECKED_IN',1),"+
+                    "('cancel',1,?,540,570,'alice','alice','CANCELLED',1),"+
+                    "('deny',1,?,540,570,'alice','alice','REJECTED',1),"+
+                    "('expiry',1,?,540,570,'alice','alice','EXPIRED',1),"+
+                    "('exempt',1,?,540,570,'alice','alice','COMPLETED',0),"+
+                    "('future',1,?,540,570,'alice','alice','CONFIRMED',1),"+
+                    "('pending',1,?,540,570,'bob','bob','PENDING_APPROVAL',1)",
+                    past,past,current,past,past,past,past,future,future);
+            return null;
+        });
+        JsonNode users = JSON.readTree(Reports.usage(store,today.minusDays(1),today.plusDays(1),"month")).get(0).path("users");
+        JsonNode alice = users.get(0), bob = users.get(1);
+        assertEquals("alice",alice.path("username").asText());
+        assertEquals(8,alice.path("bookings").intValue());
+        assertEquals(1,alice.path("noShows").intValue());
+        assertEquals(1.0/3,alice.path("noShowRate").doubleValue(),0);
+        assertEquals("bob",bob.path("username").asText());
+        assertEquals(1,bob.path("bookings").intValue());
+        assertTrue(bob.path("noShowRate").isNull());
+    }
+
     @Test public void selectCountIsIndependentOfRangeAndGranularity() throws Exception {
         Logger sql = Logger.getLogger("rooms.sql");
         Level previous = sql.getLevel();
