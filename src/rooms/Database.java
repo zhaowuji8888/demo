@@ -120,7 +120,39 @@ class Database {
                 update(c,"ALTER TABLE bookings ADD COLUMN reminded INT DEFAULT 0 NOT NULL");
                 update(c,"INSERT INTO schema_history(version) VALUES (3)");
             }
+            if (rows(c,"SELECT version FROM schema_history WHERE version=4").isEmpty()) {
+                migrateCheckinPolicy(c);
+                update(c,"INSERT INTO schema_history(version) VALUES (4)");
+            }
             return null;
         });
+    }
+
+    private static void migrateCheckinPolicy(Connection c) throws SQLException {
+        update(c,"ALTER TABLE bookings ADD COLUMN checkin_required SMALLINT DEFAULT 0 NOT NULL");
+        // Booking creation and its audit event have shared one transaction since check-in was introduced.
+        update(c,"UPDATE bookings SET checkin_required=1 WHERE EXISTS "+
+                "(SELECT 1 FROM admin_log a WHERE a.operation='create-booking' AND a.target=bookings.id)");
+        for (String[] account : rows(c,"SELECT DISTINCT owner_name FROM bookings WHERE checkin_required=0 AND status='NO_SHOW'")) {
+            // Rebuild only affected accounts, preserving strikes and suspensions earned on eligible bookings.
+            int strikes=0;
+            long until=0;
+            String events="SELECT a.at_time FROM admin_log a JOIN bookings b ON b.id=a.target "+
+                    "WHERE a.operation='state' AND a.reason='NO_SHOW' AND b.status='NO_SHOW' "+
+                    "AND b.checkin_required=1 AND b.owner_name=? ORDER BY a.seq";
+            try (PreparedStatement p=prepare(c,events,account[0]); ResultSet r=p.executeQuery()) {
+                while (r.next()) {
+                    if (++strikes==3) {
+                        until=r.getTimestamp(1).getTime()+java.util.concurrent.TimeUnit.DAYS.toMillis(7);
+                        strikes=0;
+                    }
+                }
+            }
+            update(c,"UPDATE accounts SET strikes=?,suspended_until=? WHERE username=?",strikes,until,account[0]);
+        }
+        update(c,"INSERT INTO admin_log(actor,operation,target,reason) "+
+                "SELECT '/system','correct-no-show',id,'Legacy booking was exempt from check-in' "+
+                "FROM bookings WHERE checkin_required=0 AND status='NO_SHOW'");
+        update(c,"UPDATE bookings SET status='COMPLETED' WHERE checkin_required=0 AND status='NO_SHOW'");
     }
 }

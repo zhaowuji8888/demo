@@ -107,7 +107,7 @@ public final class BookingStore extends RoomCatalog {
                 checkRoom(c,room,day,needs,attendees);
                 String id=UUID.randomUUID().toString();
                 String status="1".equals(rows(c,"SELECT approval FROM rooms WHERE id=?",room).get(0)[0])?"PENDING_APPROVAL":"CONFIRMED";
-                update(c,"INSERT INTO bookings (id,room,booked_day,first_min,last_min,holder,owner_name,needs,attendees,status,series_id) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                update(c,"INSERT INTO bookings (id,room,booked_day,first_min,last_min,holder,owner_name,needs,attendees,status,series_id,checkin_required) VALUES (?,?,?,?,?,?,?,?,?,?,?,1)",
                     id,room,day.date,day.start,day.end,user.name,user.name,needs,attendees,status,series);
                 try { reserveSlots(c,id,room,day); }
                 catch(Problem e) { throw new Problem(e.status,e.code,"Room "+room+" is occupied on "+day.date+" at "+Server.time(Integer.toString(day.start))); }
@@ -288,7 +288,7 @@ public final class BookingStore extends RoomCatalog {
         });
     }
     private static String[] lifecycleRow(Connection c,String id) throws SQLException {
-        List<String[]> b=rows(c,"SELECT owner_name,status,booked_day,first_min,last_min FROM bookings WHERE id=?",id);
+        List<String[]> b=rows(c,"SELECT owner_name,status,booked_day,first_min,last_min,checkin_required FROM bookings WHERE id=?",id);
         if(b.isEmpty()) throw new Problem(404,"Booking not found");
         return b.get(0);
     }
@@ -323,7 +323,11 @@ public final class BookingStore extends RoomCatalog {
                     String next=null;
                     if(b[1].equals("CHECKED_IN") && !now.isBefore(end)) next="COMPLETED";
                     if(b[1].equals("PENDING_APPROVAL") && !now.isBefore(start)) next="EXPIRED";
-                    if(b[1].equals("CONFIRMED") && !now.isBefore(start.plusMinutes(15))) next="NO_SHOW";
+                    if(b[1].equals("CONFIRMED")) {
+                        boolean requiresCheckin="1".equals(b[5]);
+                        if(requiresCheckin && !now.isBefore(start.plusMinutes(15))) next="NO_SHOW";
+                        if(!requiresCheckin && !now.isBefore(end)) next="COMPLETED";
+                    }
                     if(next!=null) {
                         transition(c,item[0],b[1],next);
                         update(c,"DELETE FROM slots WHERE booking=?",item[0]);

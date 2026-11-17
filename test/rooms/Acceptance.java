@@ -12,6 +12,7 @@ final class Acceptance {
     }
     static BookingStore.Window w(LocalDate d,int from,int end) { return new BookingStore.Window(d,from,end); }
     static void run() throws Exception {
+        CheckinMigrationTest.run();
         Time clock=new Time();
         BookingStore db=new BookingStore("jdbc:derby:memory:accept;create=true",clock);
         Accounts accounts=new Accounts(db,clock);

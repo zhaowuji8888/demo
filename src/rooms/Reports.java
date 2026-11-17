@@ -59,10 +59,13 @@ final class Reports {
                     peaks.merge(day.getDayOfWeek().getValue()+"@"+Server.time(""+(slot*30)),1,Integer::sum);
             }
         }
-        for(String[] row:Database.rows(c,"SELECT owner_name,status,COUNT(*) FROM bookings WHERE booked_day BETWEEN ? AND ? GROUP BY owner_name,status",first,last)) {
-            int[] count=users.computeIfAbsent(row[0],k -> new int[2]);
-            int n=Integer.parseInt(row[2]);count[0]+=n;
-            if("NO_SHOW".equals(row[1])) count[1]+=n;
+        for(String[] row:Database.rows(c,"SELECT owner_name,status,checkin_required,COUNT(*) FROM bookings WHERE booked_day BETWEEN ? AND ? GROUP BY owner_name,status,checkin_required",first,last)) {
+            int[] count=users.computeIfAbsent(row[0],k -> new int[3]);
+            int n=Integer.parseInt(row[3]);count[0]+=n;
+            if("1".equals(row[2])) {
+                count[2]+=n;
+                if("NO_SHOW".equals(row[1])) count[1]+=n;
+            }
         }
         StringJoiner rooms=new StringJoiner(",","[","]"),people=new StringJoiner(",","[","]"),heat=new StringJoiner(",","{","}");
         for(Map.Entry<Integer,int[]> row:metrics.entrySet()) {
@@ -71,7 +74,7 @@ final class Reports {
         }
         for(Map.Entry<String,int[]> row:users.entrySet()) {
             int[] n=row.getValue();
-            people.add("{\"username\":"+Server.q(row.getKey())+",\"bookings\":"+n[0]+",\"noShows\":"+n[1]+",\"noShowRate\":"+ratio(n[1],n[0])+"}");
+            people.add("{\"username\":"+Server.q(row.getKey())+",\"bookings\":"+n[0]+",\"noShows\":"+n[1]+",\"noShowRate\":"+ratio(n[1],n[2])+"}");
         }
         peaks.forEach((k,v) -> heat.add(Server.q(k)+":"+v));
         List<Integer> idle=new ArrayList<>(metrics.keySet());
