@@ -4,7 +4,7 @@ Java 8、JDBC 和 Derby 实现的单机会议室预约服务。员工登录后�
 
 ## 构建与回归测试
 
-在项目根目录使用完整 JDK（Java 8 或 11）和 Maven 3.6.3 或更新的 Maven 3，执行 `mvn verify`。首次构建从 Maven Central 下载 Derby 和测试依赖，生成 `target/roombook-2.0.0.jar`。JUnit 会运行原有业务与迁移测试，以及使用本机随机端口和内存 Derby 的 HTTP 测试。详细结果在 `target/surefire-reports/`。测试覆盖员工匿名日程、越权、时段冲突、改期回滚和过期扫描结果。
+在项目根目录使用完整 JDK（Java 8 或 11）和 Maven 3.6.3 或更新的 Maven 3，执行 `mvn verify`。首次构建从 Maven Central 下载 Derby 和测试依赖，生成 `target/roombook-2.0.0.jar`。JUnit 按业务场景分别报告领域测试，并运行 HTTP 接口和报表测试。详细结果在 `target/surefire-reports/`。例如，要单独复查改期后被旧扫描结果误判爽约的场景，可执行 `mvn "-Dtest=DomainSuite#staleScanPreservesRescheduledBooking" test`。
 
 ## 启动（Windows PowerShell）
 
@@ -120,4 +120,8 @@ $derby = if ($env:DERBY_JAR) { $env:DERBY_JAR } else { Join-Path $jdk 'db\lib\de
 
 ## 简历写法
 
-实现支持员工和管理员角色的会议室预约服务，支持按容量与设备组合查房、预约改期、维护排期及操作审计。通过 JDBC 事务、锁和时段复合主键协调预约与维护的并发写入，并验证改期冲突时保留原预约。
+**RoomBook 会议室预约系统**（Java 8、JDBC、Apache Derby、JUnit）
+
+- 使用 JDBC 事务、房间版本号和半小时时段复合主键处理预约与维护冲突。在 12 个线程争抢同一时段的测试中，仅一次写入成功。修复改期与爽约扫描并发时的误罚：写入爽约状态时核对原预约日期、起止时间和状态。
+- 将使用率报表改为按日期范围批量读取，以 BitSet 计算预约与可用时段的交集。365 天报表由 1,201 次 SELECT 降至 6 次。在同一份 Derby 基准数据上，分别校验 7 天和 365 天报表的 JSON，两组结果的 SHA-256 均与优化前一致。
+- 编写数据库升级逻辑，依据审计记录纠正历史爽约处罚，区分审批拒绝与自动过期。通过升级和重启测试核对预约状态、账户处罚及审计记录，并在 GitHub Actions 运行领域、HTTP 接口和报表回归测试。

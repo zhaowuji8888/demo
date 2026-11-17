@@ -18,33 +18,52 @@ public class StoreTest {
         }
         throw new AssertionError("expected "+status);
     }
-    static BookingStore.Window at(int start,int end) {
-        return new BookingStore.Window(LocalDate.now().plusDays(3),start,end);
+    final Acceptance.Time clock = new Acceptance.Time();
+    final BookingStore db;
+    final Accounts accounts;
+    final Accounts.User alice, bob, admin;
+    final String aliceToken;
+
+    StoreTest() throws SQLException {
+        db = new BookingStore("jdbc:derby:memory:store"+UUID.randomUUID()+";create=true", clock);
+        accounts = new Accounts(db, clock);
+        accounts.bootstrap("test-admin-password");
+        accounts.register("alice","test-alice-password");
+        accounts.register("bobby","test-bobby-password");
+        aliceToken = accounts.login("ALICE","test-alice-password","local");
+        alice = accounts.authenticate(aliceToken);
+        bob = accounts.authenticate(accounts.login("bobby","test-bobby-password","local"));
+        admin = accounts.authenticate(accounts.login("admin","test-admin-password","local"));
+    }
+
+    BookingStore.Window at(int start,int end) {
+        return new BookingStore.Window(LocalDate.now(clock).plusDays(3),start,end);
     }
     static List<String> available(BookingStore db, BookingStore.Window w, int people, String needs) throws SQLException {
         List<String> ids = new ArrayList<>();
         for (String[] room : db.availableRooms(w,people,needs)) ids.add(room[0]);
         return ids;
     }
-    public static void main(String[] args) throws Exception {
-        BookingStore db = new BookingStore("jdbc:derby:memory:roomtest;create=true");
-        Accounts accounts = new Accounts(db);
-        accounts.bootstrap("test-admin-password");
-        accounts.register("alice","test-alice-password");
-        accounts.register("bobby","test-bobby-password");
+    void registrationAndLogout() throws Exception {
         expect(409,() -> accounts.register("ADMIN","test-claim-admin"));
         expect(409,() -> accounts.register("Alice","test-duplicate"));
         expect(401,() -> accounts.login("alice","incorrect","local"));
-        String token = accounts.login("ALICE","test-alice-password","local");
-        Accounts.User alice = accounts.authenticate(token);
-        Accounts.User bob = accounts.authenticate(accounts.login("bobby","test-bobby-password","local"));
-        Accounts.User admin = accounts.authenticate(accounts.login("admin","test-admin-password","local"));
+        accounts.logout(aliceToken);
+        expect(401,() -> accounts.authenticate(aliceToken));
+    }
+
+    void bookingOwnership() throws Exception {
         BookingStore.Window hour = at(600,660);
         String id = db.book(alice,3,hour,"camera,projector",1);
         expect(403,() -> db.cancel(bob,id,"fake"));
         expect(403,() -> db.reschedule(bob,id,null,3,at(660,720),1));
         expect(400,() -> db.cancel(admin,id,""));
         check(db.agenda(hour.date.toLocalDate(),bob.name,false).isEmpty(),"my bookings isolation");
+    }
+
+    void equipmentAndCapacity() throws Exception {
+        BookingStore.Window hour = at(600,660);
+        String id = db.book(alice,3,hour,"camera,projector",1);
         expect(409,() -> db.reschedule(alice,id,null,2,hour,1));
         expect(409,() -> db.book(alice,1,hour,"projector",1));
         check(available(db,at(660,690),5,"whiteboard, camera").equals(Arrays.asList("3")),"all equipment + capacity + adjacent");
@@ -52,6 +71,12 @@ public class StoreTest {
         check(available(db,hour,13,"").isEmpty(),"no room large enough");
         expect(400,() -> db.availableRooms(hour,1,"unknown"));
         expect(400,() -> at(605,660));
+        expect(409,() -> db.book(alice,1,hour,"",20));
+    }
+
+    void maintenanceAndRescheduleRollback() throws Exception {
+        BookingStore.Window hour = at(600,660);
+        String id = db.book(alice,3,hour,"camera,projector",1);
         expect(403,() -> db.setEnabled(bob,1,false,"closed"));
         expect(403,() -> db.addMaintenance(bob,1,hour,"repair"));
         check(expect(409,() -> db.addMaintenance(admin,3,at(570,630),"repair")).conflicts.get(0)[0].equals(id),"conflict list");
@@ -68,6 +93,15 @@ public class StoreTest {
         db.reschedule(admin,id,"owner requested",3,at(630,690),1);
         check(available(db,at(600,630),1,"camera").size()==1,"old slot released on overlapping move");
         db.cancel(admin,id,"meeting cancelled");
+        List<String> actions = new ArrayList<>();
+        for (String[] row : db.auditLog(admin)) actions.add(row[2]);
+        check(actions.containsAll(Arrays.asList("add-maintenance","remove-maintenance","reschedule","cancel")), "committed changes audited");
+        check(Collections.frequency(actions,"add-maintenance")==1 && Collections.frequency(actions,"reschedule")==1, "failed changes leave no audit entry");
+        expect(403,() -> db.auditLog(bob));
+    }
+
+    void disabledRooms() throws Exception {
+        BookingStore.Window hour = at(600,660);
         db.setEnabled(admin,3,false,"closed");
         expect(409,() -> db.book(bob,3,hour,"",1));
         String other = db.book(bob,2,hour,"",1);
@@ -75,20 +109,36 @@ public class StoreTest {
         check(available(db,hour,1,"camera").isEmpty(),"disabled hidden");
         db.setEnabled(admin,3,true,"reopened");
         check(available(db,hour,1,"camera").size()==1,"re-enabled");
-        check(db.auditLog(admin).size()>=6,"only committed admin actions audited");
-        expect(403,() -> db.auditLog(bob));
-        accounts.logout(token);
-        expect(401,() -> accounts.authenticate(token));
-        expect(409,() -> db.book(alice,1,hour,"",20));
-        testRace(db,bob,admin,hour,true);
-        BookingStore.Window later = new BookingStore.Window(hour.date.toLocalDate().plusDays(1),600,660);
+    }
+
+    void concurrentMaintenanceAndBookings() throws Exception {
+        testRace(db,bob,admin,at(600,660),true);
+    }
+
+    void concurrentBookingsAndAdjacentSlots() throws Exception {
+        BookingStore.Window later = at(600,660);
         testRace(db,bob,admin,later,false);
         expect(409,() -> db.book(bob,1,new BookingStore.Window(later.date.toLocalDate(),570,630),"",1));
         String adjacent = db.book(bob,1,new BookingStore.Window(later.date.toLocalDate(),570,600),"",1);
         db.cancel(bob,adjacent,null);
+    }
+
+    public static void main(String[] args) throws Exception {
+        new StoreTest().registrationAndLogout();
+        new StoreTest().bookingOwnership();
+        new StoreTest().equipmentAndCapacity();
+        new StoreTest().maintenanceAndRescheduleRollback();
+        new StoreTest().disabledRooms();
+        new StoreTest().concurrentMaintenanceAndBookings();
+        new StoreTest().concurrentBookingsAndAdjacentSlots();
+        new Acceptance().bookingHorizon();
+        new Acceptance().loginLimits();
+        new Acceptance().calendarOverrides();
+        new Acceptance().recurringRollbackAndReschedule();
+        new Acceptance().checkinAndPenalties();
         StaleScanTest.run();
-        Acceptance.run();
-        System.out.println("PASS login, ownership, audit, equipment, closures, rollback, legacy and concurrent booking");
+        CheckinMigrationTest.run();
+        System.out.println("PASS domain scenarios");
     }
 
     static void testRace(BookingStore db, Accounts.User user, Accounts.User admin, BookingStore.Window w,
