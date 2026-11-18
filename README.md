@@ -1,8 +1,10 @@
 # RoomBook · 会议室预约服务
 
-Java 8、JDBC 和 Derby 实现的单机会议室预约服务。员工登录后可按人数、设备和时段查房，创建、查看、修改或取消自己的预约。管理员管理房间状态、维护窗口和预约代办。服务监听本机 127.0.0.1，预约时间按 Asia/Shanghai 解释。
+RoomBook 是基于 **Java 17、Spring Boot、MySQL 8 和 JDBC** 的会议室预约后端。员工可按人数、设备和时段查找空闲会议室，创建、改期或取消预约。管理员可管理房间状态、维护窗口并代办预约。
 
-也可使用 `platform/` 下的 Spring Boot + MySQL 版本。两个入口共用预约业务规则、HTTP 路径和响应格式。
+真实 MySQL 集成测试验证了 **6 个并发请求抢同一时段时仅 1 笔预约成功**，以及改期冲突后原预约和时段仍然保留。[查看集成测试](platform/src/test/java/rooms/MySqlBookingTest.java)
+
+服务默认监听 `127.0.0.1:8080`，预约时间按 Asia/Shanghai 解释。项目也提供 Java 8 + Derby 入口，两个版本共用预约业务规则、HTTP 路径和响应格式。
 
 ## Spring Boot + MySQL
 
@@ -42,7 +44,7 @@ mvn -f platform/pom.xml verify
 
 测试启动实际的 Spring MVC HTTP 服务与 MySQL 连接，验证多个请求抢同一时段只有一笔预约写入、改期冲突回滚、取消释放时段。未设置 `ROOMBOOK_MYSQL_TEST_URL` 时跳过这组集成测试。
 
-## 快速开始
+## Derby 版快速开始
 
 在项目根目录使用 JDK 8 或 11 和 Maven 3.6.3+（3.x）运行以下命令。生成的 JAR 已包含 Derby 驱动。
 
@@ -174,8 +176,8 @@ $derby = if ($env:DERBY_JAR) { $env:DERBY_JAR } else { Join-Path $jdk 'db\lib\de
 
 ## 简历写法
 
-**RoomBook 会议室预约系统**（Java 8、JDBC、Apache Derby、JUnit）
+**RoomBook 会议室预约系统**（Java 17、Spring Boot、MySQL 8、JDBC、Flyway、JUnit）
 
-- 使用 JDBC 事务、房间版本号和半小时时段复合主键处理预约与维护冲突。模拟 12 名不同员工同时争抢同一房间的一小时，验证仅一笔预约成功，两个半小时时段都归属于该笔预约。通过核对预约日期、起止时间和状态，修复改期与爽约扫描并发时的误罚。
-- 将使用率报表改为按日期范围批量读取，以 BitSet 计算预约与可用时段的交集。365 天报表由 1,201 次 SELECT 降至 6 次。在同一份 Derby 基准数据上，分别校验 7 天和 365 天报表的 JSON，两组结果的 SHA-256 均与优化前一致。
+- 使用 InnoDB 房间行锁和半小时时段复合主键处理并发预约，通过 JDBC 事务保证改期失败可回滚。MySQL 集成测试验证 6 个并发请求争抢同一时段仅 1 笔成功，改期冲突时保留原预约与时段。
+- 将使用率报表改为按日期范围批量读取，以 BitSet 计算已订与可用时段的交集。在 732 条预约的 Derby 内存库基准中，365 天报表的 SELECT 次数从 1,201 降至 6，7 天和 365 天报表的 JSON 校验值均与优化前一致。
 - 编写数据库升级逻辑，依据审计记录纠正历史爽约处罚，区分审批拒绝与自动过期。通过升级和重启测试核对预约状态、账户处罚及审计记录，并在 GitHub Actions 运行领域、HTTP 接口和报表回归测试。
