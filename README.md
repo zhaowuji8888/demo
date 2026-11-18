@@ -2,6 +2,17 @@
 
 Java 8、JDBC 和 Derby 实现的单机会议室预约服务。员工登录后可按人数、设备和时段查房，创建、查看、修改或取消自己的预约。管理员管理房间状态、维护窗口和预约代办。服务监听本机 127.0.0.1，预约时间按 Asia/Shanghai 解释。
 
+## 快速开始
+
+在项目根目录使用 JDK 8 或 11 和 Maven 3.6.3+（3.x）运行以下命令。生成的 JAR 已包含 Derby 驱动。
+
+```sh
+mvn verify
+java -jar target/roombook-2.0.0.jar
+```
+
+服务启动后，在另一个终端进入项目目录，用 Python 3 运行 `python demo-booking.py`（部分系统命令为 `python3`）。脚本会注册演示员工，预约次日 10:00 的空闲会议室，从员工日程核对预约编号，然后取消预约并释放时段。按 Ctrl+C 停止服务。
+
 ## 构建与回归测试
 
 在项目根目录使用完整 JDK（Java 8 或 11）和 Maven 3.6.3 或更新的 Maven 3，执行 `mvn verify`。首次构建从 Maven Central 下载 Derby 和测试依赖，生成 `target/roombook-2.0.0.jar`。JUnit 按业务场景分别报告领域测试，并运行 HTTP 接口和报表测试。详细结果在 `target/surefire-reports/`。例如，要单独复查改期后被旧扫描结果误判爽约的场景，可执行 `mvn "-Dtest=DomainSuite#staleScanPreservesRescheduledBooking" test`。
@@ -82,7 +93,7 @@ POST 使用 application/x-www-form-urlencoded。除注册、登录外均需 Auth
 | GET /admin/dead-letters、POST /admin/dead-letters/replay | 查看失败邮件，按 id 重新投递 |
 | GET /admin/reports/usage | from、to、granularity（week/month），最多 366 天 |
 
-所有路径也支持 `/api` 前缀。创建与改期须在 30 天内，开始时间允许 5 分钟宽限，每次最多 4 小时，每人每天最多 5 笔有效预约。登录连续失败 5 次后锁定 15 分钟，同一 IP 每分钟最多发起 20 次登录请求。
+所有路径也支持 `/api` 前缀。创建或改期到需要审批的房间，须在会议开始前提交。免审批房间允许开始后 5 分钟内提交。预约须在 30 天内，每次最多 4 小时，每人每天最多 5 笔有效预约。日历规则 `weekly` 和 `override` 必须同时传入 `start` 和 `end`，全天关闭可显式传入两个 `00:00`。登录连续失败 5 次后锁定 15 分钟，同一 IP 每分钟最多发起 20 次登录请求。
 
 报表按请求范围裁剪首尾周或月。可用分钟按当前房间状态和开放日历计算，并扣除维护时段。已订分钟只累计可用时段中已确认、已签到或已完成的预约。使用率等于已订分钟除以可用分钟；可用分钟为零时返回 `null`。
 
@@ -125,6 +136,6 @@ $derby = if ($env:DERBY_JAR) { $env:DERBY_JAR } else { Join-Path $jdk 'db\lib\de
 
 **RoomBook 会议室预约系统**（Java 8、JDBC、Apache Derby、JUnit）
 
-- 使用 JDBC 事务、房间版本号和半小时时段复合主键处理预约与维护冲突。在 12 个线程争抢同一时段的测试中，仅一次写入成功。修复改期与爽约扫描并发时的误罚：写入爽约状态时核对原预约日期、起止时间和状态。
+- 使用 JDBC 事务、房间版本号和半小时时段复合主键处理预约与维护冲突。模拟 12 名不同员工同时争抢同一房间的一小时，验证仅一笔预约成功，两个半小时时段都归属于该笔预约。通过核对预约日期、起止时间和状态，修复改期与爽约扫描并发时的误罚。
 - 将使用率报表改为按日期范围批量读取，以 BitSet 计算预约与可用时段的交集。365 天报表由 1,201 次 SELECT 降至 6 次。在同一份 Derby 基准数据上，分别校验 7 天和 365 天报表的 JSON，两组结果的 SHA-256 均与优化前一致。
 - 编写数据库升级逻辑，依据审计记录纠正历史爽约处罚，区分审批拒绝与自动过期。通过升级和重启测试核对预约状态、账户处罚及审计记录，并在 GitHub Actions 运行领域、HTTP 接口和报表回归测试。

@@ -112,15 +112,33 @@ public class StoreTest {
     }
 
     void concurrentMaintenanceAndBookings() throws Exception {
-        testRace(db,bob,admin,at(600,660),true);
+        testRace(db,Collections.nCopies(12,bob),admin,at(600,660),true);
     }
 
     void concurrentBookingsAndAdjacentSlots() throws Exception {
         BookingStore.Window later = at(600,660);
-        testRace(db,bob,admin,later,false);
+        testRace(db,Collections.nCopies(12,bob),admin,later,false);
         expect(409,() -> db.book(bob,1,new BookingStore.Window(later.date.toLocalDate(),570,630),"",1));
         String adjacent = db.book(bob,1,new BookingStore.Window(later.date.toLocalDate(),570,600),"",1);
         db.cancel(bob,adjacent,null);
+    }
+
+    void distinctEmployeesCompeteForOneRoom() throws Exception {
+        List<Accounts.User> employees=new ArrayList<>();
+        for(int i=0;i<12;i++) {
+            String name="employee"+i;
+            accounts.register(name,"employee-password");
+            employees.add(new Accounts.User(name,false));
+        }
+        BookingStore.Window hour=at(600,660);
+        String winner=testRace(db,employees,admin,hour,false);
+        List<String[]> bookings=db.query("SELECT id FROM bookings WHERE room=1 AND booked_day=?",hour.date);
+        check(bookings.size()==1 && winner.equals(bookings.get(0)[0]),"only the winning booking exists");
+        List<String[]> slots=db.query("SELECT minute_of_day,booking FROM slots WHERE room=1 AND booked_day=? ORDER BY minute_of_day",hour.date);
+        check(slots.size()==2,"one slot for each half hour");
+        for(int i=0;i<slots.size();i++) {
+            check(Integer.parseInt(slots.get(i)[0])==600+30*i && winner.equals(slots.get(i)[1]),"winning booking owns each slot");
+        }
     }
 
     public static void main(String[] args) throws Exception {
@@ -131,6 +149,7 @@ public class StoreTest {
         new StoreTest().disabledRooms();
         new StoreTest().concurrentMaintenanceAndBookings();
         new StoreTest().concurrentBookingsAndAdjacentSlots();
+        new StoreTest().distinctEmployeesCompeteForOneRoom();
         new Acceptance().bookingHorizon();
         new Acceptance().loginLimits();
         new Acceptance().calendarOverrides();
@@ -141,29 +160,33 @@ public class StoreTest {
         System.out.println("PASS domain scenarios");
     }
 
-    static void testRace(BookingStore db, Accounts.User user, Accounts.User admin, BookingStore.Window w,
+    static String testRace(BookingStore db, List<Accounts.User> users, Accounts.User admin, BookingStore.Window w,
                          boolean includeMaintenance) throws Exception {
-        ExecutorService workers = Executors.newFixedThreadPool(12);
-        CountDownLatch ready = new CountDownLatch(12), go = new CountDownLatch(1);
-        List<Future<Boolean>> results = new ArrayList<>();
+        ExecutorService workers = Executors.newFixedThreadPool(users.size());
+        CountDownLatch ready = new CountDownLatch(users.size()), go = new CountDownLatch(1);
+        List<Future<String>> results = new ArrayList<>();
         try {
-            for (int i=0; i<12; i++) {
+            for (int i=0; i<users.size(); i++) {
+                Accounts.User user=users.get(i);
                 final boolean maintenance = includeMaintenance && i==0;
                 results.add(workers.submit(() -> {
                     ready.countDown();
                     go.await();
                     try {
-                        if (maintenance) db.addMaintenance(admin,1,w,"concurrent repair");
-                        else db.book(user,1,w,"",1);
-                        return true;
-                    } catch (Problem e) { if (e.status!=409) throw e; return false; }
+                        if (maintenance) return db.addMaintenance(admin,1,w,"concurrent repair");
+                        return db.book(user,1,w,"",1);
+                    } catch (Problem e) { if (e.status!=409) throw e; return null; }
                 }));
             }
             check(ready.await(10,TimeUnit.SECONDS),"workers ready");
             go.countDown();
-            int wins=0;
-            for (Future<Boolean> result : results) if (result.get(30,TimeUnit.SECONDS)) wins++;
-            check(wins==1,"one writer owns the time slot");
+            List<String> winners=new ArrayList<>();
+            for (Future<String> result : results) {
+                String id=result.get(30,TimeUnit.SECONDS);
+                if(id!=null) winners.add(id);
+            }
+            check(winners.size()==1,"one writer owns the time slot");
+            return winners.get(0);
         } finally { go.countDown(); workers.shutdownNow(); }
     }
 }

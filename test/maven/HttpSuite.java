@@ -92,6 +92,37 @@ public class HttpSuite {
         assertTrue(db.query("SELECT booking FROM slots WHERE room=1").isEmpty());
     }
 
+    @Test public void approvalRoomsRequireAdvanceSubmissionAndPreserveFailedMove() throws Exception {
+        String admin = loginAdmin();
+        request("POST","/admin/rooms",admin,"id=1&name=Cedar&capacity=4&approval=true&reason=policy",200,"OK");
+        day = LocalDate.now(clock).toString();
+        String id = request("POST","/bookings",alice,booking(2),201,"OK").get("id").asText();
+        request("POST","/bookings",alice,booking(1),409,"APPROVAL_CLOSED");
+        clock.now = clock.now.plusSeconds(120);
+        request("POST","/bookings",bob,booking(3),201,"OK");
+        request("PUT","/bookings/"+id,alice,booking(1),409,"APPROVAL_CLOSED");
+        JsonNode original = request("GET","/my-bookings?date="+day,alice,null,200,"OK").get(0);
+        assertEquals(id,original.get("id").asText());
+        assertEquals(2,original.get("room").intValue());
+        assertEquals("CONFIRMED",original.get("status").asText());
+        assertEquals(2,db.query("SELECT minute_of_day FROM slots WHERE room=2 AND booking=?",id).size());
+        assertTrue(db.query("SELECT id FROM bookings WHERE room=1").isEmpty());
+    }
+
+    @Test public void calendarHoursMustBeExplicitEvenForAllDayClosure() throws Exception {
+        String admin=loginAdmin();
+        for(String rule : new String[]{"weekly&weekday="+LocalDate.parse(day).getDayOfWeek().getValue(),"override&date="+day}) {
+            String form="room=1&reason=closed&kind="+rule;
+            for(String fields : new String[]{"","&start=00:00","&end=00:00"}) {
+                JsonNode error=response("POST","/admin/calendar",admin,form+fields,400,"INVALID_REQUEST");
+                assertEquals("Missing field: "+(fields.contains("start")?"end":"start"),error.get("message").asText());
+            }
+            request("POST","/admin/calendar",admin,form+"&start=00:00&end=00:00",200,"OK");
+            request("POST","/bookings",alice,booking(1),409,"ROOM_CLOSED");
+        }
+        assertEquals(2,db.query("SELECT seq FROM admin_log WHERE operation LIKE 'calendar-%'").size());
+    }
+
     @Test public void approvalClosesAtStartEvenWhenTheScannerHasNotRun() throws Exception {
         String admin = loginAdmin();
         request("POST","/admin/rooms",admin,"id=1&name=Cedar&capacity=4&approval=true&reason=policy",200,"OK");

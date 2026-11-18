@@ -166,9 +166,12 @@ public class Server {
             case "/admin/rooms/delete":
                 db.deleteRoom(user,Integer.parseInt(field(p,"id")),field(p,"reason")); return new Response(200,"true");
             case "/admin/calendar":
-                db.calendar(user,Integer.parseInt(p.getOrDefault("room","0")),field(p,"kind"),
+                String kind=field(p,"kind");
+                boolean needsHours=kind.equals("weekly") || kind.equals("override");
+                db.calendar(user,Integer.parseInt(p.getOrDefault("room","0")),kind,
                     p.containsKey("date")?LocalDate.parse(p.get("date")):null,Integer.parseInt(p.getOrDefault("weekday","0")),
-                    minute(p.getOrDefault("start","00:00")),minute(p.getOrDefault("end","00:00")),field(p,"reason"));
+                    minute(needsHours ? field(p,"start") : p.getOrDefault("start","00:00")),
+                    minute(needsHours ? field(p,"end") : p.getOrDefault("end","00:00")),field(p,"reason"));
                 return new Response(200,"true");
             case "/profile/email":
                 String email=field(p,"email");

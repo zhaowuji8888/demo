@@ -89,6 +89,15 @@ public final class BookingStore extends RoomCatalog {
     String book(Accounts.User user,int room,Window w,String rawNeeds,int attendees) throws SQLException {
         return recurring(user,room,w,rawNeeds,attendees,1).get(0)[0];
     }
+    private void requireApprovalOpen(LocalDate day,int firstMinute) {
+        if (!LocalDateTime.now(clock).isBefore(day.atStartOfDay().plusMinutes(firstMinute)))
+            throw new Problem(409,"APPROVAL_CLOSED","Approval closes when the meeting starts");
+    }
+    private String initialStatus(Connection c,int room,Window w) throws SQLException {
+        if (!"1".equals(rows(c,"SELECT approval FROM rooms WHERE id=?",room).get(0)[0])) return "CONFIRMED";
+        requireApprovalOpen(w.date.toLocalDate(),w.start);
+        return "PENDING_APPROVAL";
+    }
     List<String[]> recurring(Accounts.User user,int room,Window w,String rawNeeds,int attendees,int weeks) throws SQLException {
         String needs=equipment(rawNeeds);
         if(attendees<1) throw new Problem(400,"INVALID_ATTENDEES","attendees must be positive");
@@ -105,7 +114,7 @@ public final class BookingStore extends RoomCatalog {
                 if(i==0) lockRoom(c,room);
                 checkRoom(c,room,day,needs,attendees);
                 String id=UUID.randomUUID().toString();
-                String status="1".equals(rows(c,"SELECT approval FROM rooms WHERE id=?",room).get(0)[0])?"PENDING_APPROVAL":"CONFIRMED";
+                String status=initialStatus(c,room,day);
                 update(c,"INSERT INTO bookings (id,room,booked_day,first_min,last_min,holder,owner_name,needs,attendees,status,series_id,checkin_required) VALUES (?,?,?,?,?,?,?,?,?,?,?,1)",
                     id,room,day.date,day.start,day.end,user.name,user.name,needs,attendees,status,series);
                 try { reserveSlots(c,id,room,day); }
@@ -177,11 +186,11 @@ public final class BookingStore extends RoomCatalog {
             lockRoom(c,Math.min(old,room));
             if (old!=room) lockRoom(c,Math.max(old,room));
             checkRoom(c,room,w,booking[1],count);
+            String next=initialStatus(c,room,w);
             if(update(c,"UPDATE bookings SET room=?,booked_day=?,first_min=?,last_min=?,attendees=? WHERE id=? AND room=? AND status IN ('CONFIRMED','PENDING_APPROVAL')",
                 room,w.date,w.start,w.end,count,id,old)!=1) throw new Problem(409,"BOOKING_CHANGED","Booking changed");
             update(c,"DELETE FROM slots WHERE booking=?",id);
             reserveSlots(c,id,room,w);
-            String next="1".equals(rows(c,"SELECT approval FROM rooms WHERE id=?",room).get(0)[0])?"PENDING_APPROVAL":"CONFIRMED";
             update(c,"UPDATE bookings SET status=?,reminded=0 WHERE id=?",next,id);
             audit(c,user,"reschedule",id,why==null?"Rescheduled":why);
             notice(c,booking[0],id,"RESCHEDULED","Moved to room "+room+" on "+w.date+" at "+Server.time(Integer.toString(w.start)));
@@ -279,11 +288,7 @@ public final class BookingStore extends RoomCatalog {
                 update(c,"UPDATE bookings SET status=status WHERE id=?",id);
             }
             String[] b=lifecycleRow(c,id);
-            if (approve && "PENDING_APPROVAL".equals(b[1])) {
-                LocalDateTime start = LocalDate.parse(b[2]).atStartOfDay().plusMinutes(Integer.parseInt(b[3]));
-                if (!LocalDateTime.now(clock).isBefore(start))
-                    throw new Problem(409,"APPROVAL_CLOSED","Approval closes when the meeting starts");
-            }
+            if (approve && "PENDING_APPROVAL".equals(b[1])) requireApprovalOpen(LocalDate.parse(b[2]),Integer.parseInt(b[3]));
             transition(c,id,"PENDING_APPROVAL",approve?"CONFIRMED":"REJECTED");
             if(!approve) update(c,"DELETE FROM slots WHERE booking=?",id);
             audit(c,user,approve?"approve":"deny",id,why);

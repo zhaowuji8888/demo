@@ -35,6 +35,10 @@ public class DomainSuite {
         new Acceptance().bookingHorizon();
     }
 
+    @Test public void distinctEmployeesCompeteForOneRoom() throws Exception {
+        new StoreTest().distinctEmployeesCompeteForOneRoom();
+    }
+
     @Test public void loginLimits() throws Exception {
         new Acceptance().loginLimits();
     }

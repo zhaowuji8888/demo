@@ -16,3 +16,11 @@ jobs:
           java-version: '8'
           cache: maven
       - run: mvn --batch-mode verify
+      - name: Book a room using the packaged JAR
+        working-directory: ${{ runner.temp }}
+        run: |
+          java -jar "$GITHUB_WORKSPACE/target/roombook-2.0.0.jar" 18080 &
+          server=$!
+          trap 'kill "$server"' EXIT
+          curl --silent --show-error --retry 20 --retry-connrefused --retry-delay 1 --max-time 3 http://127.0.0.1:18080/api/rooms >/dev/null
+          python3 "$GITHUB_WORKSPACE/demo-booking.py" --port 18080
