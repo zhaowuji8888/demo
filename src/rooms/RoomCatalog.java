@@ -14,7 +14,9 @@ class RoomCatalog extends Database {
     }
 
     static void lockRoom(Connection c,int id) throws SQLException {
-        List<String[]> current=rows(c,"SELECT version FROM rooms WHERE id=? AND deleted=0",id);
+        String query = "SELECT version FROM rooms WHERE id=? AND deleted=0";
+        if (mysql(c)) query += " FOR UPDATE";
+        List<String[]> current=rows(c,query,id);
         if(current.isEmpty()) throw new Problem(404,"Room not found");
         if(update(c,"UPDATE rooms SET version=version+1 WHERE id=? AND version=?",id,Long.parseLong(current.get(0)[0]))!=1)
             throw new Problem(409,"ROOM_CHANGED","Room changed concurrently, retry the request");

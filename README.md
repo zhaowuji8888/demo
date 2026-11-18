@@ -2,6 +2,46 @@
 
 Java 8、JDBC 和 Derby 实现的单机会议室预约服务。员工登录后可按人数、设备和时段查房，创建、查看、修改或取消自己的预约。管理员管理房间状态、维护窗口和预约代办。服务监听本机 127.0.0.1，预约时间按 Asia/Shanghai 解释。
 
+也可使用 `platform/` 下的 Spring Boot + MySQL 版本。两个入口共用预约业务规则、HTTP 路径和响应格式。
+
+## Spring Boot + MySQL
+
+需要 JDK 17、Maven 3.6.3+ 和 MySQL 8。使用管理员账号执行以下 SQL，先替换示例密码。
+
+```sql
+CREATE DATABASE roombook CHARACTER SET utf8mb4;
+CREATE USER 'roombook'@'localhost' IDENTIFIED BY '<your_password>';
+GRANT ALL PRIVILEGES ON roombook.* TO 'roombook'@'localhost';
+```
+
+从项目根目录运行。PowerShell 会提示输入数据库密码。
+
+```powershell
+$dbCredential = Get-Credential -UserName roombook -Message '输入 RoomBook 的 MySQL 密码'
+$env:ROOMBOOK_MYSQL_USER = $dbCredential.UserName
+$env:ROOMBOOK_MYSQL_PASSWORD = $dbCredential.GetNetworkCredential().Password
+$env:ROOMBOOK_MYSQL_URL = 'jdbc:mysql://127.0.0.1:3306/roombook'
+mvn -f platform/pom.xml package
+java -jar platform/target/roombook-platform-2.0.0.jar
+```
+
+首次启动时，Flyway 创建 InnoDB 表并初始化三间示例会议室。HikariCP 提供 JDBC 连接，现有事务代码负责提交和回滚。MySQL 使用 `READ COMMITTED`，预约和维护通过房间行锁协调写入，时段复合主键防止同一房间重复占用。
+
+默认地址是 `http://127.0.0.1:8080`。可用 `ROOMBOOK_PORT` 修改端口，首次启动时可通过 `ROOMBOOK_ADMIN_PASSWORD` 初始化管理员。在另一个终端运行 `python demo-booking.py`，可验证员工注册、预约、查询日程和取消。MySQL 使用独立数据库，已有 Derby 数据可继续用下文的原版入口访问。
+
+如果 Windows 上的 JDK 报 `Unable to establish loopback connection`，可用 `-Djava.io.tmpdir` 和 `-Djdk.net.unixdomain.tmpdir` 将 JVM 临时目录指向一个已存在的短路径目录。
+
+### MySQL 集成测试
+
+准备一个空的测试库（例如 `roombook_test`），将库权限授予上面配置的数据库账号。用独立的测试库运行以下命令。
+
+```powershell
+$env:ROOMBOOK_MYSQL_TEST_URL = 'jdbc:mysql://127.0.0.1:3306/roombook_test'
+mvn -f platform/pom.xml verify
+```
+
+测试启动实际的 Spring MVC HTTP 服务与 MySQL 连接，验证多个请求抢同一时段只有一笔预约写入、改期冲突回滚、取消释放时段。未设置 `ROOMBOOK_MYSQL_TEST_URL` 时跳过这组集成测试。
+
 ## 快速开始
 
 在项目根目录使用 JDK 8 或 11 和 Maven 3.6.3+（3.x）运行以下命令。生成的 JAR 已包含 Derby 驱动。

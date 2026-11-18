@@ -2,6 +2,7 @@
 /data/
 /derby.log
 /target/
+/platform/target/
 /.build/
 /.env
 /dependency-download.log
