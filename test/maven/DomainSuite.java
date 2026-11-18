@@ -55,6 +55,14 @@ public class DomainSuite {
         new Acceptance().checkinAndPenalties();
     }
 
+    @Test public void staleCheckinAfterReschedule() throws Exception {
+        new Acceptance().staleCheckinAfterReschedule();
+    }
+
+    @Test public void seriesMoveUsesFinalDailyCounts() throws Exception {
+        new Acceptance().seriesMoveUsesFinalDailyCounts();
+    }
+
     @Test public void staleScanPreservesRescheduledBooking() throws Exception {
         StaleScanTest.run();
     }

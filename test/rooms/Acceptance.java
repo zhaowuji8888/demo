@@ -85,4 +85,59 @@ final class Acceptance {
         }
         StoreTest.check(StoreTest.expect(403,()->db.book(user,room,w(start.plusDays(5),600,660),"",1)).code.equals("BOOKING_SUSPENDED"),"suspension");
     }
+
+    void seriesMoveUsesFinalDailyCounts() throws Exception {
+        LocalDate first = today.plusDays(1);
+        LocalDate second = first.plusWeeks(1);
+        LocalDate third = second.plusWeeks(1);
+        List<String[]> series = db.recurring(user, 1, w(first, 600, 660), "", 1, 2);
+        String firstId = series.get(0)[0], secondId = series.get(1)[0];
+        for (int minute = 720; minute < 840; minute += 30) {
+            db.book(user, 1, w(second, minute, minute + 30), "", 1);
+            db.book(user, 1, w(third, minute, minute + 30), "", 1);
+        }
+        String extra = db.book(user, 1, w(third, 840, 870), "", 1);
+        BookingStore.Window destination = w(second, 600, 660);
+        Problem limit = StoreTest.expect(409, () -> db.moveSeries(user, firstId, null, 1, destination, 1, true));
+        StoreTest.check("DAILY_QUOTA".equals(limit.code), "six on the final day exceeds quota");
+        assertReservedOn(firstId, first);
+        assertReservedOn(secondId, second);
+        StoreTest.check(db.query("SELECT id FROM notices WHERE kind='RESCHEDULED'").isEmpty(), "no partial move notices");
+
+        db.cancel(user, extra, null);
+        db.moveSeries(user, firstId, null, 1, destination, 1, true);
+        assertReservedOn(firstId, second);
+        assertReservedOn(secondId, third);
+        StoreTest.check(db.agenda(second, user.name, false).size() == 5, "five active bookings on the overlap date");
+        StoreTest.check(db.agenda(third, user.name, false).size() == 5, "five active bookings on the final date");
+    }
+
+    private void assertReservedOn(String id, LocalDate day) throws java.sql.SQLException {
+        String date = day.toString();
+        StoreTest.check(date.equals(db.query("SELECT booked_day FROM bookings WHERE id=?", id).get(0)[0]), "booking date");
+        List<String[]> slots = db.query("SELECT booked_day FROM slots WHERE booking=?", id);
+        StoreTest.check(slots.size() == 2 && slots.stream().allMatch(slot -> date.equals(slot[0])), "both slots follow booking");
+    }
+
+    void staleCheckinAfterReschedule() throws Exception {
+        String id = db.book(user, 1, w(today, 600, 660), "", 1);
+        LocalDate tomorrow = today.plusDays(1);
+        // checkin reads its clock after loading the booking. Commit a move on another connection at that point.
+        Time interleaved = new Time() {
+            @Override public Instant instant() {
+                try {
+                    db.reschedule(user, id, null, 1, w(tomorrow, 600, 660), 1);
+                } catch (java.sql.SQLException e) {
+                    throw new AssertionError(e);
+                }
+                return clock.instant();
+            }
+        };
+        BookingStore checkins = new BookingStore(db.url, interleaved);
+        StoreTest.expect(409, () -> checkins.checkin(user, id));
+        assertReservedOn(id, tomorrow);
+        StoreTest.check(db.query("SELECT id FROM bookings WHERE id=? AND status='CONFIRMED' AND checked_in_at IS NULL", id).size() == 1,
+                "tomorrow's booking still awaits check-in");
+        StoreTest.check(db.query("SELECT seq FROM admin_log WHERE operation='checkin' AND target=?", id).isEmpty(), "no stale check-in audit");
+    }
 }

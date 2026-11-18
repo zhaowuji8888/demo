@@ -81,10 +81,15 @@ public final class BookingStore extends RoomCatalog {
         }
     }
 
-    private static void quota(Connection c,String owner,Window w,String exclude) throws SQLException {
+    private static void lockQuotaOwner(Connection c,String owner) throws SQLException {
         update(c,"UPDATE accounts SET is_admin=is_admin WHERE username=?",owner);
-        int count=Integer.parseInt(rows(c,"SELECT COUNT(*) FROM bookings WHERE owner_name=? AND booked_day=? AND status IN ('CONFIRMED','PENDING_APPROVAL','CHECKED_IN') AND id<>?",owner,w.date,exclude).get(0)[0]);
-        if (count>=5) throw new Problem(409,"DAILY_QUOTA","Daily limit is five active bookings");
+    }
+
+    private static void checkDailyQuota(Connection c,String owner,java.sql.Date day,int additional) throws SQLException {
+        String sql = "SELECT COUNT(*) FROM bookings WHERE owner_name=? AND booked_day=? " +
+                "AND status IN ('CONFIRMED','PENDING_APPROVAL','CHECKED_IN')";
+        int count = Integer.parseInt(rows(c,sql,owner,day).get(0)[0]);
+        if (count + additional > 5) throw new Problem(409,"DAILY_QUOTA","Daily limit is five active bookings");
     }
     String book(Accounts.User user,int room,Window w,String rawNeeds,int attendees) throws SQLException {
         return recurring(user,room,w,rawNeeds,attendees,1).get(0)[0];
@@ -105,10 +110,11 @@ public final class BookingStore extends RoomCatalog {
         String series=weeks==1?null:UUID.randomUUID().toString();
         return transaction(c -> {
             List<String[]> ids=new ArrayList<>();
+            lockQuotaOwner(c,user.name);
             for(int i=0;i<weeks;i++) {
                 Window day=new Window(w.date.toLocalDate().plusWeeks(i),w.start,w.end);
                 validateBooking(day);
-                quota(c,user.name,day,"");
+                checkDailyQuota(c,user.name,day.date,1);
                 long suspended=Long.parseLong(rows(c,"SELECT suspended_until FROM accounts WHERE username=?",user.name).get(0)[0]);
                 if(suspended>clock.millis()) throw new Problem(403,"BOOKING_SUSPENDED","Bookings suspended for repeated no-shows");
                 if(i==0) lockRoom(c,room);
@@ -159,19 +165,24 @@ public final class BookingStore extends RoomCatalog {
 
     void moveSeries(Accounts.User user,String id,String why,int room,Window w,Integer attendees,boolean future) throws SQLException {
         transaction(c -> {
-            authorize(c,user,id,why);
+            String owner = authorize(c,user,id,why)[0];
+            lockQuotaOwner(c,owner);
             String[] current=rows(c,"SELECT series_id,booked_day FROM bookings WHERE id=?",id).get(0);
             List<String[]> members=Collections.singletonList(new String[]{id,current[1]});
             if(future && current[0]!=null) members=rows(c,"SELECT id,booked_day FROM bookings WHERE series_id=? AND booked_day>=? AND status IN ('CONFIRMED','PENDING_APPROVAL') ORDER BY booked_day",
                 current[0],java.sql.Date.valueOf(current[1]));
             // Free the affected instances within this transaction before moving them onto each other's dates.
             for(String[] member:members) update(c,"DELETE FROM slots WHERE booking=?",member[0]);
+            Set<java.sql.Date> targetDays = new LinkedHashSet<>();
             for(String[] member:members) {
                 long offset=java.time.temporal.ChronoUnit.DAYS.between(LocalDate.parse(current[1]),LocalDate.parse(member[1]));
                 Window target=new Window(w.date.toLocalDate().plusDays(offset),w.start,w.end);
                 validateBooking(target);
                 moveOne(c,user,member[0],why,room,target,attendees);
+                targetDays.add(target.date);
             }
+            // An occurrence can move off another's target day. Count only after the whole series has moved.
+            for (java.sql.Date day : targetDays) checkDailyQuota(c,owner,day,0);
             return null;
         });
     }
@@ -181,7 +192,6 @@ public final class BookingStore extends RoomCatalog {
             if(attendees==null && !"0".equals(booking[3]) || attendees!=null && attendees<1)
                 throw new Problem(400,"INVALID_ATTENDEES","Supply a positive attendee count");
             int count=attendees==null?0:attendees;
-            quota(c,booking[0],w,id);
             int old=Integer.parseInt(booking[2]);
             lockRoom(c,Math.min(old,room));
             if (old!=room) lockRoom(c,Math.max(old,room));
@@ -314,8 +324,9 @@ public final class BookingStore extends RoomCatalog {
             LocalDateTime start=LocalDate.parse(b[2]).atStartOfDay().plusMinutes(Integer.parseInt(b[3]));
             if(!"CONFIRMED".equals(b[1]) || now.isBefore(start) || !now.isBefore(start.plusMinutes(15)))
                 throw new Problem(409,"INVALID_STATE","Check-in is available in the first 15 minutes");
-            transition(c,id,"CONFIRMED","CHECKED_IN");
-            update(c,"UPDATE bookings SET checked_in_at=CURRENT_TIMESTAMP WHERE id=?",id);
+            int changed = update(c,"UPDATE bookings SET status='CHECKED_IN',checked_in_at=CURRENT_TIMESTAMP"+EXPECTED_WINDOW,
+                    id,b[1],java.sql.Date.valueOf(b[2]),Integer.parseInt(b[3]),Integer.parseInt(b[4]));
+            if (changed != 1) throw new Problem(409,"INVALID_STATE","Booking changed before check-in");
             audit(c,user,"checkin",id,"Checked in");
             return null;
         });
@@ -357,7 +368,7 @@ public final class BookingStore extends RoomCatalog {
     }
 
     // A reschedule can preserve CONFIRMED. Match the entire time window before applying its consequences.
-    private static final String SCANNED_SLOT = " WHERE id=? AND status=? AND booked_day=? AND first_min=? AND last_min=?";
+    private static final String EXPECTED_WINDOW = " WHERE id=? AND status=? AND booked_day=? AND first_min=? AND last_min=?";
 
     void applyScan(ScanEntry booking,LocalDateTime now) throws SQLException {
         String next = booking.dueStatus(now);
@@ -367,12 +378,12 @@ public final class BookingStore extends RoomCatalog {
         java.sql.Date date = java.sql.Date.valueOf(booking.day);
         transaction(c -> {
             if (next == null) {
-                if (update(c,"UPDATE bookings SET reminded=1"+SCANNED_SLOT+" AND reminded=0",
+                if (update(c,"UPDATE bookings SET reminded=1"+EXPECTED_WINDOW+" AND reminded=0",
                         booking.id,booking.status,date,booking.firstMinute,booking.lastMinute)==1)
                     notice(c,booking.owner,booking.id,"REMINDER","Booking starts at "+start);
                 return null;
             }
-            int changed = update(c,"UPDATE bookings SET status=?"+SCANNED_SLOT,next,booking.id,booking.status,
+            int changed = update(c,"UPDATE bookings SET status=?"+EXPECTED_WINDOW,next,booking.id,booking.status,
                     date,booking.firstMinute,booking.lastMinute);
             if (changed == 0) return null;
             update(c,"DELETE FROM slots WHERE booking=?",booking.id);

@@ -155,6 +155,8 @@ public class StoreTest {
         new Acceptance().calendarOverrides();
         new Acceptance().recurringRollbackAndReschedule();
         new Acceptance().checkinAndPenalties();
+        new Acceptance().staleCheckinAfterReschedule();
+        new Acceptance().seriesMoveUsesFinalDailyCounts();
         StaleScanTest.run();
         CheckinMigrationTest.run();
         System.out.println("PASS domain scenarios");
